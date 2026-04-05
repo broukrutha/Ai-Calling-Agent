@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sarvam AI Voice Agent — RAG-Powered Voice Assistant</title>
+  <meta name="description" content="Low-latency AI Voice Agent powered by Sarvam AI APIs (Saaras v3, Sarvam-M, Bulbul v3) with RAG document retrieval and Cal.com booking integration." />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div class="app-container">
+
+  <!-- ── Header ── -->
+  <header class="app-header">
+    <div class="header-brand">
+      <div class="brand-icon">🎙️</div>
+      <div class="brand-text">
+        <h1>Sarvam Voice Agent</h1>
+        <p>RAG-Powered · Low-Latency · Sarvam AI</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <div class="status-badge" id="api-status-badge">
+        <div class="status-dot" id="api-dot"></div>
+        <span id="api-status-text">Connecting…</span>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="refresh-btn" onclick="checkHealth()">⟳ Refresh</button>
+    </div>
+  </header>
+
+  <!-- ── Tabs ── -->
+  <div class="tabs" role="tablist">
+    <button class="tab-btn active" id="tab-voice" onclick="switchTab('voice')" role="tab">🎤 Voice Chat</button>
+    <button class="tab-btn" id="tab-docs" onclick="switchTab('docs')" role="tab">📄 Documents</button>
+    <button class="tab-btn" id="tab-booking" onclick="switchTab('booking')" role="tab">📅 Booking</button>
+    <button class="tab-btn" id="tab-bench" onclick="switchTab('bench')" role="tab">📊 Benchmark</button>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 1: VOICE CHAT
+  ══════════════════════════════════════════ -->
+  <div class="tab-panel active" id="panel-voice">
+    <div class="voice-grid">
+
+      <!-- Left: mic + waveform -->
+      <div class="card">
+        <div class="card-title">🎙 Voice Interaction</div>
+        <div class="voice-center">
+
+          <!-- Waveform -->
+          <div class="waveform-container" id="waveform">
+            <!-- bars injected by JS -->
+          </div>
+
+          <!-- Mic button with rings -->
+          <div class="mic-button-wrap">
+            <div class="ring ring-1"></div>
+            <div class="ring ring-2"></div>
+            <div class="ring ring-3"></div>
+            <button class="mic-button" id="mic-btn" onclick="toggleRecording()" title="Click to record">
+              🎤
+            </button>
+          </div>
+          <p class="mic-hint" id="mic-hint">Click mic to start recording</p>
+
+          <!-- Audio playback -->
+          <audio id="response-audio" class="audio-player" controls style="display:none;"></audio>
+
+          <!-- Latency Breakdown -->
+          <div class="latency-display" id="latency-display" style="display:none; width:100%;">
+            <div class="latency-title">⏱ Latency Breakdown</div>
+            <div class="latency-row">
+              <div class="lat-label">STT</div>
+              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-stt" id="bar-stt" style="width:0%"></div></div>
+              <div class="lat-val" id="val-stt">—</div>
+            </div>
+            <div class="latency-row">
+              <div class="lat-label">RAG</div>
+              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-rag" id="bar-rag" style="width:0%"></div></div>
+              <div class="lat-val" id="val-rag">—</div>
+            </div>
+            <div class="latency-row">
+              <div class="lat-label">LLM</div>
+              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-llm" id="bar-llm" style="width:0%"></div></div>
+              <div class="lat-val" id="val-llm">—</div>
+            </div>
+            <div class="latency-row">
+              <div class="lat-label">TTS</div>
+              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-tts" id="bar-tts" style="width:0%"></div></div>
+              <div class="lat-val" id="val-tts">—</div>
+            </div>
+            <div class="total-latency">
+              <span>Total End-to-End</span>
+              <span class="val" id="val-total">—</span>
+            </div>
+            <div class="text-muted mt-8" id="cost-display"></div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Right: Conversation -->
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+          <div class="card-title" style="margin-bottom:0">💬 Conversation</div>
+          <button class="btn btn-secondary btn-sm" onclick="clearConversation()">Clear</button>
+        </div>
+
+        <div class="conversation" id="conversation">
+          <div class="message system">
+            <div>👋 Hello! Ask me anything about your documents, or say "Book an appointment".</div>
+            <div style="margin-top:4px;">Type below or use the mic →</div>
+          </div>
+        </div>
+
+        <!-- Text input -->
+        <div class="input-row mt-16">
+          <textarea class="text-input" id="text-input" rows="2"
+            placeholder="Or type your question here…"
+            onkeydown="handleKeyDown(event)"></textarea>
+          <button class="btn btn-primary" id="send-btn" onclick="sendTextQuery()">
+            Send
+          </button>
+        </div>
+
+        <div class="status-bar" id="query-status" style="display:none;">
+          <div class="spinner"></div>
+          <span id="query-status-text">Processing…</span>
+        </div>
+      </div>
+
+    </div><!-- end voice-grid -->
+
+    <!-- KB info strip -->
+    <div class="card mt-20">
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="card-title" style="margin-bottom:4px;">📦 Knowledge Base</div>
+          <div class="text-muted" id="kb-info-text">Loading…</div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary btn-sm" onclick="switchTab('docs')">+ Add Docs</button>
+          <button class="btn btn-danger btn-sm" onclick="clearKB()">🗑 Clear KB</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 2: DOCUMENTS
+  ══════════════════════════════════════════ -->
+  <div class="tab-panel" id="panel-docs">
+    <div class="voice-grid">
+
+      <!-- PDF Upload -->
+      <div class="card">
+        <div class="card-title">📄 Upload PDF</div>
+        <div class="drop-zone" id="drop-zone"
+          onclick="document.getElementById('pdf-file-input').click()"
+          ondragover="handleDragOver(event)"
+          ondragleave="handleDragLeave(event)"
+          ondrop="handleDrop(event)">
+          <div class="drop-icon">📑</div>
+          <div class="drop-text">Drop PDF here or click to browse</div>
+          <div class="drop-sub">Supported: PDF · Max 50MB</div>
+        </div>
+        <input type="file" id="pdf-file-input" accept=".pdf" onchange="uploadPDF(this.files[0])">
+        <div class="status-bar mt-12" id="pdf-status" style="display:none;">
+          <div class="spinner" id="pdf-spinner"></div>
+          <span id="pdf-status-text">Uploading…</span>
+        </div>
+      </div>
+
+      <!-- URL + Text -->
+      <div class="card">
+        <div class="card-title">🌐 Ingest URL or Text</div>
+
+        <div class="form-group">
+          <label for="url-input">Website URL</label>
+          <div class="form-row">
+            <input type="url" id="url-input" placeholder="https://example.com/about" />
+            <button class="btn btn-primary btn-sm" onclick="ingestURL()">Ingest</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="form-group">
+          <label for="text-area-input">Paste Text</label>
+          <textarea id="text-area-input" rows="5" placeholder="Paste any text content here — FAQ, product info, documentation…"></textarea>
+        </div>
+        <div class="form-group">
+          <label for="text-name-input">Source Name (optional)</label>
+          <input type="text" id="text-name-input" placeholder="e.g. Company FAQ" />
+        </div>
+        <button class="btn btn-primary" style="width:100%;" onclick="ingestText()">✅ Add to Knowledge Base</button>
+
+        <div class="status-bar mt-12" id="text-status" style="display:none;">
+          <div class="spinner" id="text-spinner"></div>
+          <span id="text-status-text">Processing…</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Recent ingestions -->
+    <div class="card mt-20">
+      <div class="card-title">📂 Ingestion History</div>
+      <div id="ingest-history" class="text-muted">No documents ingested yet.</div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       TAB 3: BOOKING
+  ══════════════════════════════════════════ -->
+  <div class="tab-panel" id="panel-booking">
+
+    <!-- Booking Stats Strip -->
+    <div class="card" style="margin-bottom:20px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+        <div class="card-title" style="margin-bottom:0;">📊 Booking Overview</div>
+        <button class="btn btn-secondary btn-sm" onclick="loadBookingStats()">⟳ Refresh</button>
+      </div>
+      <div id="booking-stats" class="text-muted" style="margin-top:8px;">Loading…</div>
+    </div>
+
+    <div class="voice-grid">
+
+      <!-- Left: Check Availability -->
+      <div class="card">
+        <div class="card-title">📅 Check Availability</div>
+        <div class="form-group">
+          <label for="booking-date">Select Date</label>
+          <input type="date" id="booking-date" onchange="checkSlots()" />
+        </div>
+        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="checkSlots()">
+          🔍 Check Available Slots
+        </button>
+        <div class="status-bar mt-12" id="slots-status" style="display:none;">
+          <div class="spinner"></div>
+          <span>Checking availability…</span>
+        </div>
+        <div id="slots-result" style="margin-top:16px;"></div>
+      </div>
+
+      <!-- Right: Book Appointment -->
+      <div class="card">
+        <div class="card-title">✅ Book Appointment</div>
+        <div class="form-group">
+          <label for="book-name">Your Name</label>
+          <input type="text" id="book-name" placeholder="e.g. Rahul Sharma" />
+        </div>
+        <div class="form-group">
+          <label for="book-email">Your Email</label>
+          <input type="email" id="book-email" placeholder="e.g. rahul@example.com" />
+        </div>
+        <div class="form-group">
+          <label for="book-date">Date</label>
+          <input type="date" id="book-date" onchange="autoLoadSlots()" />
+        </div>
+        <div class="form-group">
+          <label for="book-time">Time (IST)</label>
+          <select id="book-time">
+            <option value="09:00">9:00 AM</option>
+            <option value="10:00">10:00 AM</option>
+            <option value="11:00">11:00 AM</option>
+            <option value="12:00">12:00 PM</option>
+            <option value="13:00">1:00 PM</option>
+            <option value="14:00">2:00 PM</option>
+            <option value="15:00">3:00 PM</option>
+            <option value="16:00">4:00 PM</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" style="width:100%;" onclick="bookAppointment()">
+          📅 Confirm Booking
+        </button>
+        <div class="status-bar mt-12" id="book-status" style="display:none;">
+          <div class="spinner"></div>
+          <span id="book-status-text">Booking…</span>
+        </div>
+        <div id="book-result" style="margin-top:16px;"></div>
+      </div>
+
+    </div>
+
+    <!-- Natural Language Booking -->
+    <div class="card mt-20">
+      <div class="card-title">🎤 Voice / Natural Language Booking</div>
+      <p class="text-muted" style="margin-bottom:12px; font-size:0.85rem;">
+        Type a one-shot booking request in natural language — e.g. "Book me an appointment tomorrow at 2 PM"
+      </p>
+      <div class="form-group">
+        <label for="nl-name">Your Name</label>
+        <input type="text" id="nl-name" placeholder="Your name" />
+      </div>
+      <div class="form-group">
+        <label for="nl-email">Your Email</label>
+        <input type="email" id="nl-email" placeholder="Your email" />
+      </div>
+      <div class="input-row mt-8">
+        <textarea class="text-input" id="nl-booking-input" rows="2"
+          placeholder="e.g. Book me an appointment tomorrow at 2 PM"></textarea>
+        <button class="btn btn-primary" onclick="naturalBooking()">Book</button>
+      </div>
+      <div class="status-bar mt-12" id="nl-status" style="display:none;">
+        <div class="spinner"></div>
+        <span>Processing your request…</span>
+      </div>
+      <div id="nl-result" style="margin-top:16px;"></div>
+    </div>
+
+    <!-- Booking History -->
+    <div class="card mt-20">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+        <div class="card-title" style="margin-bottom:0;">📋 Booking History</div>
+        <button class="btn btn-secondary btn-sm" onclick="loadBookingHistory()">⟳ Refresh</button>
+      </div>
+      <div id="booking-history-list">
+        <span class="text-muted">Loading booking history…</span>
+      </div>
+    </div>
+
+  </div><!-- end panel-booking -->
+
+  <!-- ══════════════════════════════════════════
+       TAB 4: BENCHMARK
+  ══════════════════════════════════════════ -->
+  <div class="tab-panel" id="panel-bench">
+
+    <div class="card" style="margin-bottom:20px;">
+      <div class="card-title">🚀 Run Benchmark</div>
+      <div style="display:flex; align-items:flex-end; gap:14px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:120px;">
+          <label for="bench-n">Number of queries (1–20)</label>
+          <input type="number" id="bench-n" value="5" min="1" max="20" style="max-width:100px;" />
+        </div>
+        <button class="btn btn-primary" id="bench-btn" onclick="runBenchmark()">▶ Run Benchmark</button>
+        <button class="btn btn-secondary btn-sm" id="bench-report-btn" onclick="downloadReport()" style="display:none;">⬇ Download JSON Report</button>
+      </div>
+      <div class="status-bar mt-12" id="bench-status" style="display:none;">
+        <div class="spinner"></div>
+        <span id="bench-status-text">Running benchmark…</span>
+      </div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div class="bench-grid" id="bench-kpis" style="display:none;">
+      <div class="kpi-card">
+        <div class="kpi-lbl">Latency P50</div>
+        <div class="kpi-val" id="bkpi-p50">—</div>
+        <div class="kpi-sub">Budget: 3000ms</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Latency P95</div>
+        <div class="kpi-val" id="bkpi-p95">—</div>
+        <div class="kpi-sub">95th percentile</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Within Budget</div>
+        <div class="kpi-val" id="bkpi-budget">—</div>
+        <div class="kpi-sub">≤3000ms queries</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Cost / Query</div>
+        <div class="kpi-val green" id="bkpi-cost">—</div>
+        <div class="kpi-sub" id="bkpi-cost100"></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">LLM Cost</div>
+        <div class="kpi-val green">FREE</div>
+        <div class="kpi-sub">Sarvam-M (₹0/token)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-lbl">Queries</div>
+        <div class="kpi-val purple" id="bkpi-queries">—</div>
+        <div class="kpi-sub" id="bkpi-errors"></div>
+      </div>
+    </div>
+
+    <!-- Component bars -->
+    <div class="card" id="bench-comp-card" style="display:none; margin-bottom:20px;">
+      <div class="card-title">⏱ Component Latency Breakdown (Mean)</div>
+      <div class="bench-comp">
+        <div class="comp-row">
+          <div class="comp-lbl">STT</div>
+          <div class="comp-track"><div class="comp-fill fill-stt" id="bc-stt" style="width:0%"></div></div>
+          <div class="comp-ms" id="bcv-stt">—</div>
+        </div>
+        <div class="comp-row">
+          <div class="comp-lbl">RAG</div>
+          <div class="comp-track"><div class="comp-fill fill-rag" id="bc-rag" style="width:0%"></div></div>
+          <div class="comp-ms" id="bcv-rag">—</div>
+        </div>
+        <div class="comp-row">
+          <div class="comp-lbl">LLM</div>
+          <div class="comp-track"><div class="comp-fill fill-llm" id="bc-llm" style="width:0%"></div></div>
+          <div class="comp-ms" id="bcv-llm">—</div>
+        </div>
+        <div class="comp-row">
+          <div class="comp-lbl">TTS</div>
+          <div class="comp-track"><div class="comp-fill fill-tts" id="bc-tts" style="width:0%"></div></div>
+          <div class="comp-ms" id="bcv-tts">—</div>
+        </div>
+      </div>
+
+      <div class="tradeoff-section mt-16">
+        <h3>📈 Trade-off Analysis</h3>
+        <p><strong>Latency vs Accuracy:</strong> The RAG retrieval step adds ~20–80ms but ensures answers are grounded in your documents — preventing hallucinations. Without RAG, the LLM answers from training data only.</p>
+        <p><strong>Cost vs Performance:</strong> Sarvam-M is currently free, making this system extremely affordable. Primary costs are STT (₹30/hr audio) and TTS (₹30/10K chars). Local embeddings eliminate all embedding API costs.</p>
+        <p><strong>Open-Source Alternative:</strong> Replace Sarvam-M with Whisper (STT) + Llama 3 (LLM) + MeloTTS (TTS) for near-zero cost, at the expense of ~2–5× higher latency and more infrastructure work.</p>
+      </div>
+    </div>
+
+    <!-- Results table -->
+    <div class="card" id="bench-table-card" style="display:none;">
+      <div class="card-title">📋 Query Results</div>
+      <div style="overflow-x:auto;">
+        <table id="bench-table" style="width:100%; border-collapse:collapse; font-size:0.83rem;">
+          <thead>
+            <tr style="background:rgba(255,255,255,0.04);">
+              <th style="padding:10px 12px; text-align:left; color:var(--text-muted);">Query</th>
+              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">RAG (ms)</th>
+              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">LLM (ms)</th>
+              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">Total (ms)</th>
+              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">Cost (₹)</th>
+            </tr>
+          </thead>
+          <tbody id="bench-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- end panel-bench -->
+
+</div><!-- end app-container -->
+
+<!-- Toast container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

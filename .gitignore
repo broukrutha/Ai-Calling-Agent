@@ -1,0 +1,28 @@
+# 🔐 Environment variables (IMPORTANT)
+.env*
+!.env.example
+
+# 🧠 Virtual environment
+.venv/
+
+# 🐍 Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# 🧾 Logs
+*.log
+
+# 🧠 Vector DB / embeddings
+chroma_db/
+
+# 💻 OS files
+.DS_Store
+Thumbs.db
+
+# ⚙️ VS Code
+.vscode/
+
+# 📦 Build files
+dist/
+build/

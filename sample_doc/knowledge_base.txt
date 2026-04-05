@@ -1,0 +1,63 @@
+Sarvam AI Voice Agent — Sample Knowledge Base
+
+About This System
+This is a low-latency, cost-efficient AI Voice Agent powered by Sarvam AI APIs.
+The system uses Retrieval-Augmented Generation (RAG) to answer user queries
+based on website content, PDFs, or any text documents you provide.
+
+Key Features
+- Real-time speech recognition using Saaras v3 (Sarvam AI)
+- Document-grounded answers using ChromaDB vector search
+- Natural speech synthesis using Bulbul v3 (Sarvam AI)
+- Support for 22+ Indian languages including Hindi, Tamil, Telugu, Bengali, and English
+- Target response latency of under 1 second end-to-end
+
+Sarvam AI API Stack
+Speech-to-Text: Saaras v3 model supports 22 Indian languages, streaming/batch modes, speaker diarization
+LLM: Sarvam-M is a multilingual LLM supporting 11 Indic languages natively. Currently offered completely FREE.
+Text-to-Speech: Bulbul v3 offers 30+ speaker voices with streaming support and multiple audio formats.
+
+Pricing Information
+STT - Saaras v3: Rs 30 per hour of audio
+TTS - Bulbul v3: Rs 30 per 10000 characters
+LLM - Sarvam-M: Free (currently Rs 0 per token)
+New users receive Rs 1000 in free credits — enough for approximately 30000 queries.
+
+Getting Started
+1. Get a free API key from cloud.sarvam.ai
+2. Copy .env.example to .env and add your SARVAM_API_KEY
+3. Install dependencies with: pip install -r requirements.txt
+4. Start the server with: python app.py
+5. Open http://localhost:8000 in your browser
+6. Upload a PDF or paste text in the Documents tab
+7. Ask questions in the Voice Chat tab
+
+Architecture Overview
+The voice pipeline flows as follows:
+User speaks into microphone which is captured by the browser.
+Audio is sent over WebSocket to the FastAPI backend.
+Saaras v3 STT converts the audio to text in approximately 150-200 milliseconds.
+ChromaDB retrieves relevant document chunks in approximately 20-50 milliseconds.
+Sarvam-M LLM generates a grounded answer in approximately 200-400 milliseconds.
+Bulbul v3 TTS converts the answer to speech in approximately 100-200 milliseconds.
+Audio response is sent back to the browser and played automatically.
+
+Languages Supported
+English with Indian accent, Hindi, Bengali, Tamil, Telugu, Gujarati, Kannada, Malayalam, Marathi, Punjabi, Odia.
+The system also supports code-mixed inputs combining English with any Indian language.
+
+Data Privacy
+All document processing happens on your own infrastructure.
+Only query text is sent to Sarvam AI APIs — your raw documents stay local in ChromaDB.
+Audio recordings are processed in real-time and not stored on the server.
+
+Technical Requirements
+Python 3.10 or higher
+4GB RAM minimum (8GB recommended for larger knowledge bases)
+Internet connection for Sarvam AI API calls
+Modern browser with WebRTC microphone support
+
+Support and Contact
+For Sarvam AI API support visit docs.sarvam.ai
+For API key issues contact support at cloud.sarvam.ai
+For this voice agent implementation please refer to the README.md file.
