@@ -1,60 +1,60 @@
 # 📞 AI Calling Agent
 
-An intelligent AI-powered voice calling system that can make, receive, and manage phone calls using Large Language Models (LLMs), Speech-to-Text (STT), Text-to-Speech (TTS), and telephony services.
+An AI-powered voice calling platform that enables real-time phone conversations using Large Language Models (LLMs), Speech-to-Text (STT), Text-to-Speech (TTS), and VoIP telephony integration.
 
-The project enables natural conversations between users and an AI assistant over voice calls, making it useful for customer support, appointment booking, information assistance, lead qualification, and automated communication. Modern AI calling systems commonly combine LLMs with telephony and speech technologies to provide real-time conversational experiences.
+The system can automatically answer calls, interact with users using natural language, handle customer inquiries, schedule appointments, and provide intelligent voice-based assistance.
 
 ---
 
-# 🚀 Features
+## 🚀 Key Features
 
-### 🎙️ Voice-Based Conversations
+### 🤖 AI-Powered Conversations
 
-* Real-time speech interaction
-* Human-like AI responses
-* Context-aware conversations
-
-### 🤖 AI Intelligence
-
-* Natural Language Understanding
-* Intelligent response generation
-* Conversation memory
+* Natural language understanding
+* Context-aware responses
+* Real-time conversational AI
 * Multi-turn dialogue support
 
-### 🔊 Speech Processing
+### 📞 Voice Calling
+
+* Outbound AI calls
+* Inbound call handling
+* Automated voice interactions
+* VoIP integration
+
+### 🎙️ Speech Processing
 
 * Speech-to-Text (STT)
 * Text-to-Speech (TTS)
 * Real-time audio streaming
 
-### 📞 Calling System
+### 📅 Appointment & Booking Support
 
-* Outbound AI Calls
-* Inbound Call Handling
-* Automated Call Routing
-* Call Logging
+* Automated appointment scheduling
+* Booking management
+* Follow-up call automation
 
-### 📊 Analytics
+### 📊 Evaluation & Analytics
 
-* Conversation History
-* Call Records
-* User Interaction Tracking
+* Call performance evaluation
+* Conversation quality analysis
+* Response tracking
 
 ---
 
-# 🏗️ System Architecture
+## 🏗️ System Architecture
 
 ```text
 User Call
     │
     ▼
-Telephony Service
+VoBIZ Telephony
     │
     ▼
 Speech-to-Text Engine
     │
     ▼
-LLM / AI Agent
+OpenAI / LLM
     │
     ▼
 Text-to-Speech Engine
@@ -65,95 +65,92 @@ Voice Response
 
 ---
 
-# 🛠️ Technology Stack
-
-## Frontend
-
-* HTML
-* CSS
-* JavaScript
-
-## Backend
-
-* Python
-* Flask / FastAPI
-
-## AI & NLP
-
-* Gemini API / OpenAI API
-* LangChain (Optional)
-
-## Speech Services
-
-* Speech Recognition
-* Text-to-Speech Engine
-
-## Telephony
-
-* Twilio Integration
-* Voice APIs
-
-## Database
-
-* SQLite
-* MySQL (Optional)
-
----
-
-# 📂 Project Structure
+## 📂 Project Structure
 
 ```text
 AI-Calling-Agent/
 │
-├── app.py
-├── chatbot.py
-├── config.py
-├── templates/
+├── voice_agent/
+├── evaluation/
+├── sample_doc/
 ├── static/
-├── database/
-├── models/
+│
+├── app.py
+├── telephony_vobiz.py
+├── setup_vobiz_trunk.py
+├── make_vobiz_call.py
+├── bookings.db
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-# ⚙️ Installation
+## 🛠️ Technology Stack
 
-## Clone Repository
+### Backend
+
+* Python
+* Flask
+
+### Artificial Intelligence
+
+* OpenAI GPT Models
+* Prompt Engineering
+
+### Speech Technologies
+
+* Speech-to-Text (STT)
+* Text-to-Speech (TTS)
+
+### Telephony
+
+* VoBIZ SIP Trunk
+* Voice Call Automation
+
+### Database
+
+* SQLite
+
+---
+
+## ⚙️ Installation
+
+### Clone Repository
 
 ```bash
 git clone https://github.com/broukrutha/Ai-Calling-Agent.git
 cd Ai-Calling-Agent
 ```
 
-## Create Virtual Environment
+### Create Virtual Environment
 
 ```bash
 python -m venv venv
 ```
 
-## Activate Environment
-
-### Windows
+### Activate Environment
 
 ```bash
 venv\Scripts\activate
 ```
 
-### Linux / Mac
-
-```bash
-source venv/bin/activate
-```
-
-## Install Dependencies
+### Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run Application
+### Configure Environment
+
+Create a `.env` file and add:
+
+```env
+OPENAI_API_KEY=your_api_key
+VOBIZ_API_KEY=your_api_key
+```
+
+### Run Application
 
 ```bash
 python app.py
@@ -161,50 +158,50 @@ python app.py
 
 ---
 
-# 💡 Use Cases
+## 💡 Use Cases
 
 ### Customer Support
 
-AI answers customer queries automatically.
+Automated customer service calls and query resolution.
 
-### Appointment Booking
+### Appointment Scheduling
 
-Schedule appointments through voice conversations.
+Book, reschedule, and confirm appointments automatically.
 
 ### Lead Qualification
 
-Collect customer information and qualify leads.
+Collect customer information and qualify leads through voice interactions.
+
+### Healthcare Reminders
+
+Automated medicine and appointment reminder calls.
 
 ### Educational Assistance
 
-Answer student questions over phone calls.
-
-### Healthcare Assistance
-
-Provide appointment reminders and basic guidance.
+Voice-based student support and information services.
 
 ---
 
-# 🔮 Future Enhancements
+## 🔮 Future Enhancements
 
-* Multilingual Voice Support
+* Multilingual Support
 * Emotion Detection
 * Voice Cloning
-* WhatsApp Calling Integration
-* Real-Time Analytics Dashboard
-* AI Agent Personalities
+* WhatsApp Calling
 * CRM Integration
-* Advanced Call Recording Analysis
+* Real-Time Analytics Dashboard
+* Advanced Agent Memory
+* Personalized AI Voices
 
 ---
 
-# 🎯 Project Impact
+## 🎯 Project Impact
 
-The AI Calling Agent reduces manual effort, improves response time, and provides 24/7 conversational support through automated voice interactions. AI-powered calling systems are increasingly being used for customer service, support, and workflow automation.
+This project demonstrates how conversational AI can automate voice-based interactions, reduce operational costs, and provide 24/7 intelligent assistance through phone calls.
 
 ---
 
-# 👨‍💻 Developer
+## 👨‍💻 Developer
 
 **R Broukrutha**
 
@@ -214,6 +211,4 @@ Gokaraju Rangaraju Institute of Engineering & Technology (GRIET)
 
 ---
 
-# ⭐ Support
-
-If you like this project, consider giving it a Star ⭐ on GitHub.
+⭐ If you find this project useful, consider giving it a Star.
