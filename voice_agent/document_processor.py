@@ -1,177 +1,191 @@
 """
-document_processor.py – Load and chunk documents from PDF, URL, or raw text.
-Produces LangChain Document objects ready for embedding.
+Turn PDFs, web pages and raw text into chunks ready for embedding.
+
+URL ingestion fetches attacker-influenced addresses from inside your network,
+so it is guarded against server-side request forgery: only public http(s)
+hosts are allowed, and that check is repeated for every redirect hop.
 """
+
+from __future__ import annotations
 
 import ipaddress
 import logging
 import socket
 from pathlib import Path
-from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from voice_agent.config import (
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
-    URL_INGEST_MAX_BYTES,
-    URL_INGEST_TIMEOUT_SEC,
-)
+from voice_agent import config
 
 logger = logging.getLogger(__name__)
 
+_MAX_REDIRECTS = 5
+_MAX_PDF_PAGES = 500
+_ALLOWED_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml+xml")
+_USER_AGENT = "Mozilla/5.0 (compatible; VoiceAgentBot/1.0)"
 
-def _make_splitter() -> RecursiveCharacterTextSplitter:
+
+class IngestError(ValueError):
+    """The source was rejected or could not be read. The message is user-safe."""
+
+
+def _splitter() -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
+        chunk_size=config.CHUNK_SIZE,
+        chunk_overlap=config.CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", "। ", " ", ""],
     )
 
 
-def _validate_public_url(url: str) -> None:
+# ── URL safety ───────────────────────────────────────────────────────────────
+
+def validate_public_url(url: str) -> None:
+    """Raise :class:`IngestError` unless ``url`` points at a public web host."""
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
-        raise ValueError("Only http:// and https:// URLs are allowed.")
-    if not parsed.hostname:
-        raise ValueError("URL must include a valid hostname.")
-
-    hostname = parsed.hostname.strip().lower()
-    if hostname in {"localhost", "127.0.0.1", "::1"}:
-        raise ValueError("Localhost URLs are not allowed.")
+        raise IngestError("Only http:// and https:// URLs are allowed.")
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise IngestError("The URL must include a hostname.")
+    if parsed.username or parsed.password:
+        raise IngestError("URLs with embedded credentials are not allowed.")
 
     try:
-        addrinfo = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)}
     except socket.gaierror as exc:
-        raise ValueError(f"Could not resolve host '{hostname}'.") from exc
+        raise IngestError(f"Could not resolve host '{hostname}'.") from exc
 
-    for entry in addrinfo:
-        ip_text = entry[4][0]
-        ip_obj = ipaddress.ip_address(ip_text)
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_multicast
-            or ip_obj.is_reserved
-            or ip_obj.is_unspecified
-        ):
-            raise ValueError("Private or non-public IP addresses are not allowed.")
+    for address in addresses:
+        ip = ipaddress.ip_address(address.split("%")[0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            raise IngestError("That address is not a public website.")
 
 
-# ──────────────────────────────────────────────
-# Loaders
-# ──────────────────────────────────────────────
+def _fetch_public(url: str, timeout: int) -> requests.Response:
+    """GET with redirects followed by hand so every hop is validated."""
+    session = requests.Session()
+    session.trust_env = config.HTTP_TRUST_ENV
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        validate_public_url(current)
+        resp = session.get(
+            current, headers={"User-Agent": _USER_AGENT}, timeout=timeout, stream=True, allow_redirects=False
+        )
+        if resp.is_redirect or resp.is_permanent_redirect:
+            location = resp.headers.get("Location", "")
+            resp.close()
+            if not location:
+                raise IngestError("The site sent a redirect without a destination.")
+            current = urljoin(current, location)
+            continue
+        return resp
+    raise IngestError("Too many redirects.")
 
-def load_pdf(file_bytes: bytes, filename: str = "document.pdf") -> List[Document]:
-    """Parse a PDF from raw bytes and return chunked Documents."""
+
+# ── Loaders ──────────────────────────────────────────────────────────────────
+
+def load_pdf(file_bytes: bytes, filename: str = "document.pdf") -> list[Document]:
+    """Extract text from a PDF (bytes) and chunk it."""
+    if not file_bytes.startswith(b"%PDF"):
+        raise IngestError("That file is not a valid PDF.")
+    import pymupdf
+
     try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        raise ImportError("Install PyMuPDF: pip install pymupdf")
+        pdf = pymupdf.open(stream=file_bytes, filetype="pdf")
+    except Exception as exc:
+        raise IngestError("The PDF could not be opened. It may be corrupted.") from exc
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        text = page.get_text("text").strip()
-        if text:
-            pages.append(
-                Document(
-                    page_content=text,
-                    metadata={"source": filename, "page": i + 1},
-                )
-            )
-    doc.close()
-    logger.info(f"PDF '{filename}': {len(pages)} pages loaded.")
-    return _make_splitter().split_documents(pages)
+    try:
+        if pdf.needs_pass:
+            raise IngestError("Password-protected PDFs are not supported.")
+        if pdf.page_count > _MAX_PDF_PAGES:
+            raise IngestError(f"PDFs are limited to {_MAX_PDF_PAGES} pages.")
+        pages = [
+            Document(page_content=text, metadata={"source": filename, "page": number})
+            for number, page in enumerate(pdf, start=1)
+            if (text := page.get_text("text").strip())
+        ]
+    finally:
+        pdf.close()
+
+    if not pages:
+        raise IngestError("No text was found in the PDF. Scanned documents need OCR first.")
+    logger.info("PDF '%s': %d pages with text.", filename, len(pages))
+    return _splitter().split_documents(pages)
 
 
-def load_url(url: str, timeout: int = URL_INGEST_TIMEOUT_SEC) -> List[Document]:
-    """Scrape a URL, strip HTML, and return chunked Documents."""
-    _validate_public_url(url)
-    headers = {"User-Agent": "Mozilla/5.0 (VoiceAgent/1.0)"}
-    with requests.get(url, headers=headers, timeout=timeout, stream=True) as resp:
-        resp.raise_for_status()
+def load_url(url: str, timeout: int | None = None) -> list[Document]:
+    """Download a public web page, strip the markup and chunk the text."""
+    limit = config.URL_INGEST_MAX_BYTES
+    try:
+        resp = _fetch_public(url, timeout or config.URL_INGEST_TIMEOUT_SEC)
+    except requests.RequestException as exc:
+        raise IngestError("The page could not be downloaded.") from exc
+
+    with resp:
+        if resp.status_code >= 400:
+            raise IngestError(f"The site responded with HTTP {resp.status_code}.")
         content_type = resp.headers.get("Content-Type", "").lower()
-        if not any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml+xml")):
-            raise ValueError(f"Unsupported URL content type: {content_type or 'unknown'}")
+        if not any(kind in content_type for kind in _ALLOWED_CONTENT_TYPES):
+            raise IngestError("Only HTML and plain-text pages can be ingested.")
 
-        content_length = resp.headers.get("Content-Length")
-        if content_length and int(content_length) > URL_INGEST_MAX_BYTES:
-            raise ValueError(
-                f"URL response too large. Maximum allowed size is {URL_INGEST_MAX_BYTES} bytes."
-            )
+        body = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=8192):
+                body.extend(chunk)
+                if len(body) > limit:
+                    raise IngestError(f"The page is larger than the {limit // 1024} KB limit.")
+        except requests.RequestException as exc:
+            raise IngestError("The download was interrupted.") from exc
+        html = bytes(body).decode(resp.encoding or "utf-8", errors="replace")
 
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > URL_INGEST_MAX_BYTES:
-                raise ValueError(
-                    f"URL response too large. Maximum allowed size is {URL_INGEST_MAX_BYTES} bytes."
-                )
-            chunks.append(chunk)
-        raw_html = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
-
-    soup = BeautifulSoup(raw_html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form"]):
         tag.decompose()
-
-    raw = " ".join(soup.get_text(separator="\n").split())
-    logger.info(f"URL '{url}': {len(raw)} characters scraped.")
-    docs = [Document(page_content=raw, metadata={"source": url})]
-    return _make_splitter().split_documents(docs)
-
-
-def load_text(text: str, source_name: str = "manual_input") -> List[Document]:
-    """Chunk raw plain text."""
-    docs = [Document(page_content=text.strip(), metadata={"source": source_name})]
-    return _make_splitter().split_documents(docs)
+    text = " ".join(soup.get_text(separator="\n").split())
+    if not text:
+        raise IngestError("No readable text was found on that page.")
+    logger.info("URL ingested: %d characters.", len(text))
+    return _splitter().split_documents([Document(page_content=text, metadata={"source": url})])
 
 
-def load_file(path: str) -> List[Document]:
-    """Auto-detect and load a local file (PDF or .txt)."""
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    if p.suffix.lower() == ".pdf":
-        return load_pdf(p.read_bytes(), filename=p.name)
-    else:
-        return load_text(p.read_text(encoding="utf-8"), source_name=p.name)
+def load_text(text: str, source_name: str = "manual_input") -> list[Document]:
+    text = (text or "").strip()
+    if not text:
+        raise IngestError("There is no text to ingest.")
+    return _splitter().split_documents([Document(page_content=text, metadata={"source": source_name})])
 
 
-# ──────────────────────────────────────────────
-# Unified entry point
-# ──────────────────────────────────────────────
+def load_file(path: str) -> list[Document]:
+    """Load a local ``.pdf`` or text file (used by the seeding script)."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise IngestError(f"File not found: {path}")
+    if file_path.suffix.lower() == ".pdf":
+        return load_pdf(file_path.read_bytes(), filename=file_path.name)
+    return load_text(file_path.read_text(encoding="utf-8"), source_name=file_path.name)
 
-def ingest(source: str | bytes, source_type: str, name: str = "") -> List[Document]:
+
+def ingest(source: str | bytes, source_type: str, name: str = "") -> list[Document]:
     """
-    Unified ingestion entry point.
+    Single entry point: ``source_type`` is ``url``, ``pdf``, ``text`` or ``file``.
 
-    Args:
-        source: URL string, file path string, text string, or PDF bytes.
-        source_type: One of 'url', 'pdf', 'text', 'file'.
-        name: Optional display name / filename.
-
-    Returns:
-        List of chunked LangChain Document objects.
+    Raises :class:`IngestError` with a message that is safe to show the user.
     """
-    source_type = source_type.lower().strip()
-    if source_type == "url":
+    kind = source_type.lower().strip()
+    if kind == "url":
         return load_url(str(source))
-    elif source_type == "pdf":
-        if isinstance(source, bytes):
-            return load_pdf(source, filename=name or "uploaded.pdf")
-        return load_pdf(Path(str(source)).read_bytes(), filename=name or str(source))
-    elif source_type == "text":
+    if kind == "pdf":
+        data = source if isinstance(source, bytes) else Path(str(source)).read_bytes()
+        return load_pdf(data, filename=name or "uploaded.pdf")
+    if kind == "text":
         return load_text(str(source), source_name=name or "text_input")
-    elif source_type == "file":
+    if kind == "file":
         return load_file(str(source))
-    else:
-        raise ValueError(f"Unknown source_type: '{source_type}'. Use url/pdf/text/file.")
+    raise IngestError(f"Unknown source type '{source_type}'.")
