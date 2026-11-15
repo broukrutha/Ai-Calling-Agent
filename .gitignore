@@ -1,28 +1,36 @@
-# 🔐 Environment variables (IMPORTANT)
-.env*
+# Secrets
+.env
+.env.*
 !.env.example
 
-# 🧠 Virtual environment
-.venv/
-
-# 🐍 Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# 🧾 Logs
-*.log
-
-# 🧠 Vector DB / embeddings
+# Runtime data: customer bookings, call logs and the vector index never belong in git
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
 chroma_db/
+data/
 
-# 💻 OS files
-.DS_Store
-Thumbs.db
-
-# ⚙️ VS Code
-.vscode/
-
-# 📦 Build files
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 dist/
 build/
+*.egg-info/
+
+# Reports and logs
+*.log
+benchmark_report.html
+results.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
