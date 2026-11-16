@@ -1,0 +1,16 @@
+.git
+.github
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+chroma_db
+data
+tests
+.venv
+venv
+__pycache__
+.pytest_cache
+.ruff_cache
+*.md

@@ -1,1188 +1,1243 @@
 /**
- * app.js – Sarvam AI Voice Agent Frontend
+ * Calling Agent Console.
  *
- * Features:
- *  - WebSocket connection to backend
- *  - Push-to-talk microphone recording (WebAudio API)
- *  - Text query support
- *  - Real-time latency visualization
- *  - Document ingestion (PDF, URL, text)
- *  - Benchmark runner + results display
- *  - Cal.com booking: slot check, create, cancel, history
+ * Everything the server sends is treated as untrusted text: the page is built
+ * from DOM nodes and textContent, never by concatenating HTML, and there are
+ * no inline handlers or styles, so it runs under a strict Content-Security-Policy.
  */
 
 'use strict';
 
-// ──────────────────────────────────────────────
-// Constants
-// ──────────────────────────────────────────────
-let BUDGET_MS = 3000;
-const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const WS_URL = `${WS_PROTOCOL}//${location.host}/ws/voice`;
-const API_BASE = '';
+// ── DOM helpers ──────────────────────────────────────────────────────────────
 
-// ──────────────────────────────────────────────
-// State
-// ──────────────────────────────────────────────
-let ws = null;
-let mediaRecorder = null;
-let audioChunks = [];
-let isRecording = false;
-let waveAnimFrame = null;
-let benchmarkData = null;
-let ingestHistory = [];
+const $ = (id) => document.getElementById(id);
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
-function getAdminHeaders() {
-  const token = window.localStorage.getItem('adminApiToken') || '';
-  return token ? { 'X-Admin-Token': token } : {};
-}
-
-function syncBudgetLabels() {
-  const p50Sub = document.querySelector('#bench-kpis .kpi-card:nth-child(1) .kpi-sub');
-  const budgetSub = document.querySelector('#bench-kpis .kpi-card:nth-child(3) .kpi-sub');
-  if (p50Sub) p50Sub.textContent = `Budget: ${BUDGET_MS}ms`;
-  if (budgetSub) budgetSub.textContent = `<=${BUDGET_MS}ms queries`;
-}
-
-// ──────────────────────────────────────────────
-// Init
-// ──────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-  buildWaveform();
-  checkHealth();
-  loadKBInfo();
-  connectWebSocket();
-  setDefaultBookingDates();
-  loadBookingStats();
-  loadBookingHistory();
-});
-
-// ──────────────────────────────────────────────
-// Tab switching
-// ──────────────────────────────────────────────
-function switchTab(tabId) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.getElementById(`tab-${tabId}`).classList.add('active');
-  document.getElementById(`panel-${tabId}`).classList.add('active');
-
-  // Refresh booking data when switching to booking tab
-  if (tabId === 'booking') {
-    loadBookingStats();
-    loadBookingHistory();
+/** el('div', {class: 'x', text: 'hi', dataset: {uid: '1'}}, child, …) */
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value === undefined || value === null) continue;
+    if (key === 'class') node.className = value;
+    else if (key === 'text') node.textContent = value;
+    else if (key === 'dataset') Object.assign(node.dataset, value);
+    else node.setAttribute(key, value);
   }
+  for (const child of children) {
+    if (child !== null && child !== undefined) node.append(child);
+  }
+  return node;
 }
 
-// ──────────────────────────────────────────────
-// WebSocket
-// ──────────────────────────────────────────────
-function connectWebSocket() {
-  clearTimeout(window._wsRetry);
-  if (ws && ws.readyState === WebSocket.OPEN) return;
-
-  ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'ping' }));
-  };
-
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    handleWSMessage(msg);
-  };
-
-  ws.onerror = () => {
-    setStatus(false, 'WS error');
-  };
-
-  ws.onclose = () => {
-    // Auto-reconnect
-    window._wsRetry = setTimeout(connectWebSocket, 3000);
-  };
+function icon(name, extraClass = '') {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', `icon ${extraClass}`.trim());
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS(SVG_NS, 'use');
+  use.setAttribute('href', `#i-${name}`);
+  svg.append(use);
+  return svg;
 }
 
-// ── Streaming state ────────────────────────────────────────────────────────
-let _streamingAnswer = '';
-let _streamingMsgEl  = null;
-let audioQueue       = [];
-let isPlayingAudio   = false;
+const show = (node, visible = true) => { if (node) node.hidden = !visible; };
+const setContent = (container, ...nodes) => container.replaceChildren(...nodes);
+const pill = (text, tone = '') => el('span', { class: `pill ${tone}`.trim(), text });
+const emptyNote = (text) => el('div', { class: 'empty-inline', text });
+const skeleton = () => el('div', {}, el('div', { class: 'skeleton' }), el('div', { class: 'skeleton' }));
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
-function queueAudioChunk(b64) {
-  audioQueue.push(b64);
-  if (!isPlayingAudio) playNextAudioChunk();
-}
+// ── State ────────────────────────────────────────────────────────────────────
 
-function playNextAudioChunk() {
-  if (audioQueue.length === 0) { isPlayingAudio = false; return; }
-  isPlayingAudio = true;
-  const b64 = audioQueue.shift();
+const state = {
+  view: 'overview',
+  health: null,
+  budgetMs: 3000,
+  locked: false,
+  ws: null,
+  wsRetryMs: 1000,
+  wsTimer: null,
+  recorder: null,
+  recording: false,
+  recordStartedAt: 0,
+  chunks: [],
+  audioContext: null,
+  meterFrame: 0,
+  streamingEl: null,
+  streamingText: '',
+  audioQueue: [],
+  currentAudio: null,
+  slot: '',
+  bookingFilter: '',
+  benchmark: null,
+};
+
+const TOKEN_KEY = 'adminApiToken';
+const storage = {
+  get(store, key) { try { return store.getItem(key) || ''; } catch (_) { return ''; } },
+  set(store, key, value) {
+    try { if (value) store.setItem(key, value); else store.removeItem(key); } catch (_) { /* storage blocked */ }
+  },
+};
+const getToken = () => storage.get(sessionStorage, TOKEN_KEY);
+
+// ── HTTP ─────────────────────────────────────────────────────────────────────
+
+/** JSON request → {ok, status, data}. Never throws for HTTP errors. */
+async function api(path, { method = 'GET', body, form, admin = false } = {}) {
+  const headers = {};
+  if (admin && getToken()) headers['X-Admin-Token'] = getToken();
+  const init = { method, headers };
+  if (form) {
+    init.body = form;
+  } else if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+
+  let response;
   try {
-    const bytes = atob(b64);
-    const arr = new Uint8Array(bytes.length);
-    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-    const blob  = new Blob([arr], { type: 'audio/wav' });
-    const url   = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    audio.onended = () => { URL.revokeObjectURL(url); playNextAudioChunk(); };
-    audio.onerror = () => { URL.revokeObjectURL(url); playNextAudioChunk(); };
-    audio.play().catch(() => playNextAudioChunk());
-  } catch(e) { playNextAudioChunk(); }
-}
-
-function handleWSMessage(msg) {
-  switch (msg.type) {
-    case 'pong':
-      setStatus(true, 'Connected');
-      break;
-
-    case 'processing':
-      showQueryStatus(true, 'Processing audio pipeline…');
-      break;
-
-    case 'transcript':
-      if (msg.text && msg.text.trim()) {
-        addMessage('user', msg.text);
-        showQueryStatus(true, 'Thinking…');
-        _streamingAnswer = '';
-        _streamingMsgEl  = null;
-      }
-      break;
-
-    case 'noise':
-      showQueryStatus(false);
-      document.getElementById('mic-hint').textContent = 'Click mic to start recording';
-      toast('Background noise — please speak clearly', 'warning');
-      break;
-
-    case 'text_chunk':
-      if (msg.text) {
-        _streamingAnswer += msg.text;
-        if (!_streamingMsgEl) {
-          _streamingMsgEl = addMessage('assistant', _streamingAnswer);
-        } else {
-          const t = _streamingMsgEl.querySelector('.msg-text');
-          if (t) t.textContent = _streamingAnswer;
-        }
-        // Auto scroll
-        const conv = document.getElementById('conversation');
-        if (conv) conv.scrollTop = conv.scrollHeight;
-      }
-      break;
-
-    case 'audio_chunk':
-      if (msg.audio) queueAudioChunk(msg.audio);
-      break;
-
-    case 'done':
-      showQueryStatus(false);
-      document.getElementById('mic-hint').textContent = 'Click mic to start recording';
-      _streamingAnswer = '';
-      _streamingMsgEl  = null;
-      if (msg.latency) updateLatencyDisplay(msg.latency, msg.cost_inr);
-      // Refresh booking history if a booking was made
-      if (msg.is_booking) {
-        loadBookingHistory();
-        loadBookingStats();
-      }
-      break;
-
-    case 'result':
-      handleVoiceResult(msg);
-      break;
-
-    case 'text_result':
-      handleTextResult(msg);
-      break;
-
-    case 'error':
-      showQueryStatus(false);
-      _streamingAnswer = '';
-      _streamingMsgEl  = null;
-      toast(`Error: ${msg.message}`, 'error');
-      break;
+    response = await fetch(path, init);
+  } catch (_) {
+    return { ok: false, status: 0, data: { detail: 'The server could not be reached.' } };
   }
+  let data = {};
+  try { data = await response.json(); } catch (_) { /* empty or non-JSON body */ }
+  if (admin) setLocked(response.status === 401);
+  return { ok: response.ok, status: response.status, data };
 }
 
-// ──────────────────────────────────────────────
-// Health check
-// ──────────────────────────────────────────────
-async function checkHealth() {
-  try {
-    const res = await fetch(`${API_BASE}/health`);
-    const data = await res.json();
-    if (Number.isFinite(data.latency_budget_ms)) {
-      BUDGET_MS = data.latency_budget_ms;
-      syncBudgetLabels();
-    }
-    const ok = data.api?.status === 'ok';
-    setStatus(ok, ok ? `Connected · ${data.api?.latency_ms?.toFixed(0)}ms` : 'API Error');
-    updateKBInfo(data.knowledge_base);
-  } catch (e) {
-    setStatus(false, 'Server offline');
-  }
+function errorText(result, fallback) {
+  if (result.status === 401) return 'Enter the admin token in Settings to do this.';
+  if (result.status === 429) return 'Too many requests. Wait a moment and try again.';
+  const detail = result.data && result.data.detail;
+  return typeof detail === 'string' && detail ? detail : fallback;
 }
 
-function setStatus(ok, text) {
-  const dot = document.getElementById('api-dot');
-  const label = document.getElementById('api-status-text');
-  dot.className = `status-dot ${ok ? 'live' : 'error'}`;
-  label.textContent = text;
+function setLocked(locked) {
+  state.locked = locked;
+  show($('lock-banner'), locked);
 }
 
-// Override health rendering with provider-aware status details.
-async function checkHealth() {
-  try {
-    const res = await fetch(`${API_BASE}/health`);
-    const data = await res.json();
-    if (Number.isFinite(data.latency_budget_ms)) {
-      BUDGET_MS = data.latency_budget_ms;
-      syncBudgetLabels();
-    }
+// ── Feedback ─────────────────────────────────────────────────────────────────
 
-    const apiStatus = data.api?.status || 'error';
-    let statusState = 'error';
-    if (apiStatus === 'ok') statusState = 'ok';
-    else if (apiStatus === 'degraded') statusState = 'warn';
-
-    let statusText = 'API Error';
-    if (apiStatus === 'ok') {
-      const latency = Number.isFinite(data.api?.latency_ms) ? ` | ${data.api.latency_ms.toFixed(0)}ms` : '';
-      const provider = data.api?.llm_provider ? ` | ${String(data.api.llm_provider).toUpperCase()}` : '';
-      statusText = `Connected${provider}${latency}`;
-    } else if (apiStatus === 'degraded') {
-      statusText = data.api?.summary || 'Degraded';
-    } else {
-      statusText = data.api?.message || data.api?.summary || 'API Error';
-    }
-
-    setStatus(statusState, statusText);
-    updateKBInfo(data.knowledge_base);
-  } catch (e) {
-    setStatus('error', 'Server offline');
-  }
+function toast(message, tone = '') {
+  const container = $('toast-container');
+  while (container.children.length >= 3) container.firstChild.remove();
+  const node = el('div', { class: `toast ${tone}`.trim(), text: message });
+  container.append(node);
+  setTimeout(() => {
+    node.classList.add('leaving');
+    setTimeout(() => node.remove(), 260);
+  }, 4200);
 }
 
-function setStatus(state, text) {
-  const dot = document.getElementById('api-dot');
-  const label = document.getElementById('api-status-text');
-  const normalized = state === 'ok' ? 'live' : (state === 'warn' ? 'warn' : 'error');
-  dot.className = `status-dot ${normalized}`;
-  label.textContent = text;
-}
-
-// ──────────────────────────────────────────────
-// KB Info
-// ──────────────────────────────────────────────
-async function loadKBInfo() {
-  try {
-    const res = await fetch(`${API_BASE}/kb/info`);
-    const data = await res.json();
-    updateKBInfo(data);
-  } catch (e) {}
-}
-
-function updateKBInfo(info) {
-  if (!info) return;
-  const el = document.getElementById('kb-info-text');
-  if (el) {
-    el.textContent = `${info.total_chunks || 0} chunks · Collection: ${info.collection || '—'} · Model: ${info.embedding_model || '—'}`;
-  }
-}
-
-async function clearKB() {
-  if (!confirm('Clear all documents from the knowledge base?')) return;
-  try {
-    const res = await fetch(`${API_BASE}/kb/clear`, {
-      method: 'DELETE',
-      headers: getAdminHeaders(),
-    });
-    if (res.status === 403) {
-      toast('Admin token required. Save it in localStorage as adminApiToken.', 'error');
-      return;
-    }
-    toast('Knowledge base cleared.', 'info');
-    loadKBInfo();
-    ingestHistory = [];
-    renderHistory();
-  } catch (e) {
-    toast('Failed to clear KB.', 'error');
-  }
-}
-
-// ──────────────────────────────────────────────
-// Waveform
-// ──────────────────────────────────────────────
-function buildWaveform() {
-  const container = document.getElementById('waveform');
-  container.innerHTML = '';
-  for (let i = 0; i < 28; i++) {
-    const bar = document.createElement('div');
-    bar.className = 'wave-bar';
-    container.appendChild(bar);
-  }
-}
-
-function setWaveformActive(active) {
-  document.querySelectorAll('.wave-bar').forEach((bar, i) => {
-    if (active) {
-      bar.classList.add('active');
-      bar.style.animationDelay = `${(i * 0.05) % 0.8}s`;
-    } else {
-      bar.classList.remove('active');
-      bar.style.height = '8px';
-    }
+/** In-page confirmation. Resolves true only when the user confirms. */
+function confirmAction(title, text, confirmLabel = 'Confirm') {
+  const dialog = $('confirm-dialog');
+  $('confirm-title').textContent = title;
+  $('confirm-text').textContent = text;
+  $('confirm-ok').textContent = confirmLabel;
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      $('confirm-ok').removeEventListener('click', onOk);
+      $('confirm-cancel').removeEventListener('click', onCancel);
+      dialog.removeEventListener('close', onClose);
+      if (dialog.open) dialog.close();
+      resolve(value);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onClose = () => finish(false);
+    $('confirm-ok').addEventListener('click', onOk);
+    $('confirm-cancel').addEventListener('click', onCancel);
+    dialog.addEventListener('close', onClose);
+    dialog.showModal();
   });
 }
 
-// ──────────────────────────────────────────────
-// Recording
-// ──────────────────────────────────────────────
-async function toggleRecording() {
-  if (isRecording) {
-    stopRecording();
+// ── Formatting ───────────────────────────────────────────────────────────────
+
+function formatTime(slot) {
+  const [hourText, minute = '00'] = String(slot || '').split(':');
+  const hour = Number(hourText);
+  if (!Number.isFinite(hour)) return slot || '';
+  return `${hour % 12 || 12}:${minute} ${hour >= 12 ? 'PM' : 'AM'}`;
+}
+
+function formatDate(iso, options = { weekday: 'short', day: 'numeric', month: 'short' }) {
+  const date = new Date(`${iso}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleDateString('en-IN', options);
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(Math.round(Number(seconds) || 0), 0);
+  const pad = (n) => String(n).padStart(2, '0');
+  const hours = Math.floor(total / 3600);
+  const rest = `${pad(Math.floor((total % 3600) / 60))}:${pad(total % 60)}`;
+  return hours ? `${hours}:${rest}` : rest.replace(/^0/, '');
+}
+
+function formatTimestamp(utc) {
+  if (!utc) return '';
+  const date = new Date(`${String(utc).replace(' ', 'T')}Z`);
+  return Number.isNaN(date.getTime())
+    ? String(utc)
+    : date.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+const formatMs = (ms) => {
+  const value = Number(ms) || 0;
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${value.toFixed(0)} ms`;
+};
+
+function localISODate(date) {
+  // toISOString() is UTC and yields yesterday's date in the evening east of Greenwich.
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+// ── Navigation ───────────────────────────────────────────────────────────────
+
+const VIEW_LOADERS = {
+  overview: () => loadOverview(),
+  playground: () => checkHealth(),
+  knowledge: () => loadSources(),
+  appointments: () => { loadBookingStats(); loadBookings(); loadSlots(); },
+  calls: () => loadCalls(),
+  evaluation: () => {},
+};
+
+function showView(name) {
+  const view = VIEW_LOADERS[name] ? name : 'overview';
+  state.view = view;
+  document.querySelectorAll('.view').forEach((section) => { section.hidden = section.id !== `view-${view}`; });
+  document.querySelectorAll('.nav-item[data-view]').forEach((link) => {
+    const active = link.dataset.view === view;
+    link.classList.toggle('active', active);
+    if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+  });
+  const section = $(`view-${view}`);
+  $('view-title').textContent = section.dataset.title;
+  $('view-subtitle').textContent = section.dataset.subtitle;
+  document.title = `${section.dataset.title} · Calling Agent Console`;
+  closeNav();
+  VIEW_LOADERS[view]();
+}
+
+function openNav() { $('sidebar').classList.add('open'); show($('scrim'), true); }
+function closeNav() { $('sidebar').classList.remove('open'); show($('scrim'), false); }
+
+// ── Theme ────────────────────────────────────────────────────────────────────
+
+const THEMES = ['system', 'light', 'dark'];
+
+function currentTheme() {
+  const saved = storage.get(localStorage, 'theme');
+  return THEMES.includes(saved) ? saved : 'system';
+}
+
+function applyTheme(theme) {
+  if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', theme);
+  storage.set(localStorage, 'theme', theme === 'system' ? '' : theme);
+  $('theme-label').textContent = `Theme: ${theme[0].toUpperCase()}${theme.slice(1)}`;
+}
+
+function cycleTheme() {
+  applyTheme(THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length]);
+}
+
+// ── Health and system status ─────────────────────────────────────────────────
+
+function setConnection(tone, text) {
+  $('conn-dot').className = `dot ${tone}`;
+  $('conn-text').textContent = text;
+}
+
+async function checkHealth() {
+  const result = await api('/health');
+  if (!result.ok) {
+    state.health = null;
+    setConnection('bad', 'Server unreachable');
+    return null;
+  }
+  const health = result.data;
+  state.health = health;
+  if (Number.isFinite(health.latency_budget_ms)) state.budgetMs = health.latency_budget_ms;
+
+  const model = health.api || {};
+  if (health.status === 'ok') setConnection('good', 'All systems operational');
+  else if (model.status === 'api_key_missing') setConnection('warn', 'Setup incomplete');
+  else if (model.status === 'error') setConnection('bad', 'Language model unreachable');
+  else setConnection('warn', 'Running with limits');
+
+  $('app-version').textContent = health.version ? `v${health.version}` : '';
+  $('about-version').textContent = health.version || '–';
+  $('about-env').textContent = health.environment || '–';
+  $('session-llm').textContent = model.llm_model ? `${model.llm_provider} · ${model.llm_model}` : 'Not configured';
+  $('session-speech').textContent = model.stt_model ? `${model.stt_model} · ${model.tts_model}` : 'Not configured';
+  renderTokenState();
+  return health;
+}
+
+function statusRow(name, detail, label, tone) {
+  return el('li', {},
+    el('div', { class: 'row-main' },
+      el('div', { class: 'row-title', text: name }),
+      el('div', { class: 'row-sub', text: detail, title: detail }),
+    ),
+    pill(label, tone),
+  );
+}
+
+function renderSystemStatus(health) {
+  const model = health.api || {};
+  const kb = health.knowledge_base || {};
+  const telephony = health.telephony || {};
+  const rows = [];
+
+  if (model.status === 'ok') {
+    const latency = Number.isFinite(model.latency_ms) ? ` · ${model.latency_ms.toFixed(0)} ms` : '';
+    rows.push(statusRow('Language model', `${model.llm_provider} · ${model.llm_model}${latency}`, 'Operational', 'good'));
+  } else if (model.status === 'api_key_missing') {
+    rows.push(statusRow('Language model', 'Add provider keys to the server environment', 'Not configured', 'warn'));
   } else {
-    await startRecording();
+    rows.push(statusRow('Language model', model.message || 'The provider did not respond', 'Unreachable', 'bad'));
+  }
+
+  rows.push(model.status === 'api_key_missing'
+    ? statusRow('Speech', 'Set SARVAM_API_KEY to enable voice', 'Not configured', 'warn')
+    : statusRow('Speech', `${model.stt_model || 'speech-to-text'} · ${model.tts_model || 'text-to-speech'}`, 'Ready', 'good'));
+
+  if (kb.available === false) rows.push(statusRow('Knowledge base', 'The embedding model could not be loaded', 'Unavailable', 'bad'));
+  else if (!kb.total_chunks) rows.push(statusRow('Knowledge base', 'No documents indexed yet', 'Empty', 'warn'));
+  else rows.push(statusRow('Knowledge base', `${plural(kb.total_chunks, 'passage')} indexed`, 'Ready', 'good'));
+
+  rows.push((health.bookings || {}).mode === 'mock'
+    ? statusRow('Calendar', 'Bookings are saved locally, not to Cal.com', 'Mock mode', 'warn')
+    : statusRow('Calendar', 'Cal.com', 'Connected', 'good'));
+
+  if (telephony.configured && telephony.outbound) rows.push(statusRow('Telephony', 'LiveKit + SIP trunk', 'Ready', 'good'));
+  else if (telephony.configured) rows.push(statusRow('Telephony', 'Inbound only: no outbound trunk configured', 'Partial', 'warn'));
+  else rows.push(statusRow('Telephony', 'LiveKit and SIP settings are missing', 'Not configured', ''));
+
+  rows.push(health.auth_required
+    ? statusRow('Access control', 'Admin token required for changes', 'Protected', 'good')
+    : statusRow('Access control', 'No admin token set on the server', 'Open', 'warn'));
+
+  setContent($('status-list'), ...rows);
+  setContent($('overview-env'), document.createTextNode(health.environment || ''));
+  $('overview-env').className = `pill plain ${health.environment === 'production' ? 'accent' : ''}`.trim();
+
+  $('tile-kb').textContent = kb.available === false ? '–' : String(kb.total_chunks || 0);
+  $('tile-kb-foot').textContent = kb.available === false ? 'Unavailable' : 'Indexed passages';
+}
+
+// ── Overview ─────────────────────────────────────────────────────────────────
+
+function callRow(call) {
+  const outbound = call.direction === 'outbound';
+  const tones = { completed: 'good', in_progress: 'accent', failed: 'bad', ringing: 'accent' };
+  return el('div', { class: 'row' },
+    el('span', { class: `dir ${outbound ? 'out' : ''}`.trim(), title: outbound ? 'Outbound' : 'Inbound' }, icon(outbound ? 'out' : 'in')),
+    el('div', { class: 'row-main' },
+      el('div', { class: 'row-title mono', text: call.phone || 'Unknown number' }),
+      el('div', { class: 'row-sub', text: [formatTimestamp(call.created_at), call.detail].filter(Boolean).join(' · ') }),
+    ),
+    el('div', { class: 'row-aside' },
+      el('span', { text: formatDuration(call.duration_sec) }),
+      pill(String(call.status || '').replace('_', ' '), tones[call.status] || ''),
+    ),
+  );
+}
+
+async function loadOverview() {
+  for (const id of ['overview-calls', 'overview-appointments']) {
+    if (!$(id).children.length) setContent($(id), skeleton());
+  }
+  const [health, calls, bookings] = await Promise.all([
+    checkHealth(),
+    api('/calls?limit=6', { admin: true }),
+    api('/booking/stats', { admin: true }),
+  ]);
+  if (health) renderSystemStatus(health);
+  else setContent($('status-list'), el('li', {}, el('div', { class: 'row-sub', text: 'The server is not responding.' })));
+
+  if (calls.ok) {
+    const stats = calls.data.stats || {};
+    $('tile-calls').textContent = String(stats.total || 0);
+    $('tile-calls-foot').textContent = `${stats.inbound || 0} inbound · ${stats.outbound || 0} outbound`;
+    $('tile-talk').textContent = formatDuration(stats.total_duration_sec);
+    $('tile-talk-foot').textContent = stats.failed ? `${plural(stats.failed, 'call')} not connected` : 'Across all calls';
+    const list = calls.data.calls || [];
+    setContent($('overview-calls'), ...(list.length
+      ? list.map(callRow)
+      : [emptyNote('No calls yet. Calls appear here as soon as the telephony worker handles one.')]));
+  } else {
+    setContent($('overview-calls'), emptyNote(errorText(calls, 'Calls could not be loaded.')));
+  }
+
+  if (bookings.ok) {
+    const stats = bookings.data.stats || {};
+    $('tile-upcoming').textContent = String(stats.upcoming || 0);
+    $('tile-upcoming-foot').textContent = `${stats.total || 0} booked in total · ${stats.cancelled || 0} cancelled`;
+    const next = bookings.data.next_appointments || [];
+    setContent($('overview-appointments'), ...(next.length
+      ? next.map((booking) => el('div', { class: 'row' },
+        el('div', { class: 'row-main' },
+          el('div', { class: 'row-title', text: `${formatDate(booking.date)} · ${formatTime(booking.time_ist)}` }),
+          el('div', { class: 'row-sub', text: `${booking.attendee_name} · ${booking.attendee_email}` }),
+        ),
+        el('div', { class: 'row-aside' }, pill(booking.source || 'manual', 'plain')),
+      ))
+      : [emptyNote('Nothing scheduled. New bookings from calls and chat show up here.')]));
+  } else {
+    setContent($('overview-appointments'), emptyNote(errorText(bookings, 'Appointments could not be loaded.')));
   }
 }
 
-async function startRecording() {
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+function renderTokenState() {
+  const note = $('admin-token-state');
+  if (getToken()) note.textContent = 'A token is saved for this browser tab.';
+  else if (state.health && state.health.auth_required) note.textContent = 'Required to manage documents, bookings and calls.';
+  else note.textContent = 'This server has no admin token set, so no token is needed (development mode).';
+}
+
+function openSettings() {
+  renderTokenState();
+  $('settings-dialog').showModal();
+}
+
+function saveToken(event) {
+  event.preventDefault();
+  const value = $('admin-token-input').value.trim();
+  if (value) storage.set(sessionStorage, TOKEN_KEY, value);
+  $('admin-token-input').value = '';
+  $('settings-dialog').close();
+  if (value) toast('Admin token saved for this tab.');
+  showView(state.view);
+}
+
+function clearToken() {
+  storage.set(sessionStorage, TOKEN_KEY, '');
+  renderTokenState();
+  toast('Admin token removed.');
+}
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+
+function connectWebSocket() {
+  clearTimeout(state.wsTimer);
+  if (state.ws && state.ws.readyState <= WebSocket.OPEN) return;
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.host}/ws/voice`);
+  state.ws = socket;
+
+  socket.addEventListener('open', () => {
+    state.wsRetryMs = 1000;
+    socket.send(JSON.stringify({ type: 'ping' }));
+  });
+  socket.addEventListener('message', (event) => {
+    let message;
+    try { message = JSON.parse(event.data); } catch (_) { return; }
+    handleSocketMessage(message);
+  });
+  socket.addEventListener('close', () => {
+    finishTurn();
+    state.wsTimer = setTimeout(connectWebSocket, state.wsRetryMs);
+    state.wsRetryMs = Math.min(state.wsRetryMs * 2, 15000);     // back off, up to 15 s
+  });
+}
+
+const socketReady = () => Boolean(state.ws) && state.ws.readyState === WebSocket.OPEN;
+
+// Keeps idle connections open through proxies and tunnels.
+setInterval(() => { if (socketReady()) state.ws.send(JSON.stringify({ type: 'ping' })); }, 25000);
+
+function handleSocketMessage(message) {
+  switch (message.type) {
+    case 'processing':
+      setBusy(true, 'Transcribing…');
+      break;
+    case 'transcript':
+      addMessage('user', message.text);
+      setBusy(true, 'Thinking…');
+      break;
+    case 'noise':
+      finishTurn();
+      toast(message.message || 'That was hard to make out. Please try again.');
+      break;
+    case 'text_chunk':
+      state.streamingText += message.text || '';
+      if (!state.streamingEl) state.streamingEl = addMessage('assistant', state.streamingText);
+      else state.streamingEl.querySelector('.msg-text').textContent = state.streamingText;
+      scrollTranscript();
+      break;
+    case 'audio_chunk':
+      if (message.audio) enqueueAudio(message.audio);
+      break;
+    case 'done':
+      if (state.streamingEl) annotateAnswer(state.streamingEl, message);
+      finishTurn();
+      renderTurn(message, 'Voice');
+      break;
+    case 'text_result':
+      annotateAnswer(addMessage('assistant', message.answer || 'No answer was returned.'), message);
+      finishTurn();
+      renderTurn(message, 'Text');
+      break;
+    case 'error':
+      finishTurn();
+      toast(message.message || 'Something went wrong.', 'bad');
+      break;
+    default:
+      break;
+  }
+}
+
+function setBusy(busy, text = '') {
+  show($('query-status'), busy);
+  if (text) $('query-status-text').textContent = text;
+  $('send-btn').disabled = busy;
+}
+
+function finishTurn() {
+  setBusy(false);
+  state.streamingEl = null;
+  state.streamingText = '';
+}
+
+// ── Audio playback ───────────────────────────────────────────────────────────
+
+function base64ToBlob(base64, type) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type });
+}
+
+function enqueueAudio(base64) {
+  state.audioQueue.push(base64);
+  if (!state.currentAudio) playNext();
+}
+
+function playNext() {
+  const next = state.audioQueue.shift();
+  if (!next) { state.currentAudio = null; return; }
+  let url;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
+    url = URL.createObjectURL(base64ToBlob(next, 'audio/wav'));
+  } catch (_) {
+    playNext();
+    return;
+  }
+  const audio = new Audio(url);
+  state.currentAudio = audio;
+  const advance = () => { URL.revokeObjectURL(url); playNext(); };
+  audio.addEventListener('ended', advance, { once: true });
+  audio.addEventListener('error', advance, { once: true });
+  audio.play().catch(advance);
+}
 
-    const mimeType = getSupportedMime();
-    mediaRecorder = new MediaRecorder(stream, { mimeType });
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
-
-    mediaRecorder.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
-      processAudio();
-    };
-
-    mediaRecorder.start(100);
-    isRecording = true;
-
-    const btn = document.getElementById('mic-btn');
-    const wrap = btn.closest('.mic-button-wrap');
-    btn.classList.add('recording');
-    btn.textContent = '⏹';
-    document.getElementById('mic-hint').textContent = 'Recording… click to stop';
-    setWaveformActive(true);
-
-    toast('Recording started', 'info');
-  } catch (e) {
-    toast('Microphone access denied. Please allow mic access.', 'error');
+/** Stop the agent speaking: used when the user starts to talk (barge-in). */
+function stopPlayback() {
+  state.audioQueue = [];
+  if (state.currentAudio) {
+    state.currentAudio.pause();
+    state.currentAudio = null;
   }
 }
 
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
-  isRecording = false;
-  const btn = document.getElementById('mic-btn');
-  btn.classList.remove('recording');
-  btn.textContent = '🎤';
-  document.getElementById('mic-hint').textContent = 'Processing…';
-  setWaveformActive(false);
+// ── Recording ────────────────────────────────────────────────────────────────
+
+const METER_BARS = 18;
+
+function buildMeter() {
+  const bars = [];
+  for (let i = 0; i < METER_BARS; i += 1) bars.push(el('i'));
+  setContent($('meter'), ...bars);
 }
 
-function getSupportedMime() {
-  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg', 'audio/mp4'];
-  for (const t of types) {
-    if (MediaRecorder.isTypeSupported(t)) return t;
-  }
-  return '';
+/** Drive the level meter from the live microphone signal. */
+function startMeter(stream) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  const context = new AudioContextClass();
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 64;
+  context.createMediaStreamSource(stream).connect(analyser);
+  state.audioContext = context;
+
+  const levels = new Uint8Array(analyser.frequencyBinCount);
+  const bars = $('meter').children;
+  const draw = () => {
+    analyser.getByteFrequencyData(levels);
+    for (let i = 0; i < bars.length; i += 1) {
+      bars[i].style.height = `${3 + Math.round((levels[i + 1] / 255) * 19)}px`;
+    }
+    const seconds = Math.floor((performance.now() - state.recordStartedAt) / 1000);
+    $('rec-timer').textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    state.meterFrame = requestAnimationFrame(draw);
+  };
+  draw();
 }
 
-async function processAudio() {
-  const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
-  const arrayBuffer = await blob.arrayBuffer();
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+function stopMeter() {
+  cancelAnimationFrame(state.meterFrame);
+  if (state.audioContext) { state.audioContext.close().catch(() => {}); state.audioContext = null; }
+}
 
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    toast('WebSocket not connected. Reconnecting…', 'error');
+function setRecordingUI(recording) {
+  state.recording = recording;
+  const button = $('mic-btn');
+  button.classList.toggle('recording', recording);
+  button.setAttribute('aria-pressed', String(recording));
+  button.setAttribute('aria-label', recording ? 'Stop and send' : 'Start recording');
+  show($('composer-live'), recording);
+  show($('text-input'), !recording);
+  show($('send-btn'), !recording);
+}
+
+function supportedMime() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  return candidates.find((type) => window.MediaRecorder && MediaRecorder.isTypeSupported(type)) || '';
+}
+
+async function toggleRecording() {
+  if (state.recording) {
+    if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    toast('This browser cannot record audio. Type your message instead.', 'bad');
+    return;
+  }
+  if (!socketReady()) {
+    toast('Reconnecting to the server. Try again in a moment.');
     connectWebSocket();
-    document.getElementById('mic-hint').textContent = 'Click mic to start recording';
     return;
   }
 
-  showQueryStatus(true, 'Sending audio to pipeline…');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+  } catch (_) {
+    toast('Microphone access is blocked. Allow it in your browser settings.', 'bad');
+    return;
+  }
 
-  ws.send(JSON.stringify({
+  stopPlayback();
+  const mimeType = supportedMime();
+  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  state.recorder = recorder;
+  state.chunks = [];
+  state.recordStartedAt = performance.now();
+
+  recorder.addEventListener('dataavailable', (event) => {
+    if (event.data.size > 0) state.chunks.push(event.data);
+  });
+  recorder.addEventListener('stop', () => {
+    const duration = performance.now() - state.recordStartedAt;
+    stopMeter();
+    stream.getTracks().forEach((track) => track.stop());
+    setRecordingUI(false);
+    sendRecording(recorder.mimeType || mimeType, duration);
+  }, { once: true });
+
+  recorder.start(250);
+  setRecordingUI(true);
+  startMeter(stream);
+}
+
+function blobToBase64(blob) {
+  // FileReader copes with recordings of any length; String.fromCharCode(...bytes)
+  // overflows the call stack once a recording passes roughly 100 KB.
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => resolve(String(reader.result).split(',', 2)[1] || '');
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function sendRecording(mimeType, durationMs) {
+  if (durationMs < 300 || state.chunks.length === 0) {
+    toast('That was too short. Keep recording while you speak.');
+    return;
+  }
+  if (!socketReady()) {
+    toast('The connection dropped. Please try again.', 'bad');
+    return;
+  }
+  let data;
+  try {
+    data = await blobToBase64(new Blob(state.chunks, { type: mimeType || 'audio/webm' }));
+  } catch (_) {
+    toast('The recording could not be read.', 'bad');
+    return;
+  }
+  setBusy(true, 'Sending audio…');
+  state.ws.send(JSON.stringify({
     type: 'audio',
-    data: b64,
-    format: 'webm',
-    language: 'en-IN',
+    data,
+    format: (mimeType || 'audio/webm').split(';')[0].replace('audio/', ''),
+    language: $('language-select').value,
+    duration_ms: Math.round(durationMs),
   }));
 }
 
-// ──────────────────────────────────────────────
-// Voice result handler
-// ──────────────────────────────────────────────
-function handleVoiceResult(msg) {
-  showQueryStatus(false);
-  document.getElementById('mic-hint').textContent = 'Click mic to start recording';
+// ── Conversation ─────────────────────────────────────────────────────────────
 
-  // Add messages
-  if (msg.transcript) {
-    addMessage('user', msg.transcript);
-  }
-  if (msg.answer) {
-    addMessage('assistant', msg.answer, msg.sources || []);
-  }
-
-  // Play audio
-  if (msg.audio) {
-    const audioEl = document.getElementById('response-audio');
-    const bytes = atob(msg.audio);
-    const arr = new Uint8Array(bytes.length);
-    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-    const blob2 = new Blob([arr], { type: 'audio/wav' });
-    audioEl.src = URL.createObjectURL(blob2);
-    audioEl.style.display = 'block';
-    audioEl.play().catch(() => {});
-  }
-
-  // Update latency
-  if (msg.latency) {
-    updateLatencyDisplay(msg.latency, msg.cost_inr);
-  }
-
-  // Refresh booking if relevant
-  if (msg.is_booking) {
-    loadBookingHistory();
-    loadBookingStats();
-  }
+function scrollTranscript() {
+  const transcript = $('conversation');
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
-// ──────────────────────────────────────────────
-// Text query
-// ──────────────────────────────────────────────
-async function sendTextQuery() {
-  const input = document.getElementById('text-input');
-  const query = input.value.trim();
-  if (!query) return;
-
-  addMessage('user', query);
-  input.value = '';
-  showQueryStatus(true, 'Querying knowledge base…');
-  document.getElementById('send-btn').disabled = true;
-
-  // Try WebSocket first for real-time feel
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'query', query }));
-  } else {
-    // Fallback to REST
-    try {
-      const res = await fetch(`${API_BASE}/query`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, language: 'en-IN' }),
-      });
-      const data = await res.json();
-      handleTextResult(data);
-    } catch (e) {
-      toast('Query failed: ' + e.message, 'error');
-      showQueryStatus(false);
-    }
-  }
-
-  document.getElementById('send-btn').disabled = false;
+function addMessage(role, text) {
+  show($('chat-empty'), false);
+  const node = el('div', { class: `msg ${role}` },
+    el('div', { class: 'msg-who', text: role === 'user' ? 'You' : 'Agent' }),
+    el('div', { class: 'msg-text', text }),
+  );
+  $('conversation').append(node);
+  scrollTranscript();
+  return node;
 }
 
-function handleTextResult(msg) {
-  showQueryStatus(false);
-  const answer = msg.answer || msg.detail || 'No answer returned.';
-  const sources = msg.sources || [];
-  addMessage('assistant', answer, sources);
-
-  if (msg.latency) {
-    const lat = {
-      stt_ms: 0,
-      retrieval_ms: msg.latency.retrieval_ms || 0,
-      llm_ms: msg.latency.llm_ms || 0,
-      tts_ms: 0,
-      total_ms: msg.latency.total_ms || 0,
-    };
-    updateLatencyDisplay(lat, msg.cost_inr);
-  }
-
-  // Refresh booking if relevant
-  if (msg.is_booking) {
-    loadBookingHistory();
-    loadBookingStats();
-  }
-}
-
-function handleKeyDown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendTextQuery();
-  }
-}
-
-// ──────────────────────────────────────────────
-// Conversation UI
-// ──────────────────────────────────────────────
-function addMessage(role, text, sources = []) {
-  const conv = document.getElementById('conversation');
-  const div = document.createElement('div');
-  div.className = `message ${role}`;
-
-  const label = document.createElement('div');
-  label.className = 'message-label';
-  label.textContent = role === 'user' ? 'You' : 'Assistant';
-  div.appendChild(label);
-
-  const content = document.createElement('div');
-  content.className = 'msg-text';
-  content.textContent = text;
-  div.appendChild(content);
-
-  if (sources.length > 0) {
-    const chips = document.createElement('div');
-    chips.className = 'source-chips';
-    sources.forEach(src => {
-      const chip = document.createElement('span');
-      chip.className = 'source-chip';
-      chip.textContent = '📄 ' + (src.length > 30 ? src.slice(0, 30) + '…' : src);
-      chips.appendChild(chip);
-    });
-    div.appendChild(chips);
-  }
-
-  conv.appendChild(div);
-  conv.scrollTop = conv.scrollHeight;
-  return div;
+/** Sources, reference number and cache marker under a finished answer. */
+function annotateAnswer(node, result) {
+  // Booking replies come from the calendar, not from documents: no source tags.
+  const sources = result.is_booking ? [] : result.sources || [];
+  const tags = sources.map((source) => el('span', { class: 'tag', text: source, title: source }));
+  if (result.ref_code) tags.unshift(el('span', { class: 'tag ref', text: `Ref ${result.ref_code}` }));
+  if (result.cached) tags.push(el('span', { class: 'tag', text: 'From cache' }));
+  if (tags.length) node.append(el('div', { class: 'msg-meta' }, ...tags));
+  scrollTranscript();
 }
 
 function clearConversation() {
-  const conv = document.getElementById('conversation');
-  conv.innerHTML = '<div class="message system"><div>Conversation cleared. Ready for new questions.</div></div>';
+  const empty = $('chat-empty');
+  setContent($('conversation'), empty);
+  show(empty, true);
 }
 
-// ──────────────────────────────────────────────
-// Latency display
-// ──────────────────────────────────────────────
-function updateLatencyDisplay(lat, costInr) {
-  const display = document.getElementById('latency-display');
-  display.style.display = 'block';
+async function sendText(query) {
+  if (!query) return;
+  addMessage('user', query);
+  setBusy(true, 'Thinking…');
+  stopPlayback();
 
-  const budget = BUDGET_MS;
-
-  function setBar(idBar, idVal, ms) {
-    const pct = Math.min((ms / budget) * 100, 100);
-    document.getElementById(idBar).style.width = `${pct}%`;
-    document.getElementById(idVal).textContent = `${ms.toFixed(0)}ms`;
+  if (socketReady()) {
+    state.ws.send(JSON.stringify({ type: 'query', query }));
+    return;
   }
+  // No socket: answer over REST. Works, but without conversation memory.
+  const result = await api('/query', { method: 'POST', body: { query } });
+  finishTurn();
+  if (!result.ok) { toast(errorText(result, 'The question could not be answered.'), 'bad'); return; }
+  annotateAnswer(addMessage('assistant', result.data.answer), result.data);
+  renderTurn(result.data, 'Text');
+}
 
-  setBar('bar-stt', 'val-stt', lat.stt_ms || 0);
-  setBar('bar-rag', 'val-rag', lat.retrieval_ms || 0);
-  setBar('bar-llm', 'val-llm', lat.llm_ms || 0);
-  setBar('bar-tts', 'val-tts', lat.tts_ms || 0);
+function submitChat(event) {
+  event.preventDefault();
+  const input = $('text-input');
+  const query = input.value.trim();
+  input.value = '';
+  autoGrow(input);
+  sendText(query);
+}
 
-  const total = lat.total_ms || 0;
-  const totalEl = document.getElementById('val-total');
-  totalEl.textContent = `${total.toFixed(0)}ms`;
-  totalEl.className = `val ${total <= budget ? 'ok' : total <= budget * 1.3 ? 'warn' : 'over'}`;
+function autoGrow(textarea) {
+  textarea.style.height = 'auto';
+  textarea.style.height = `${Math.min(textarea.scrollHeight, 140)}px`;
+}
 
-  if (costInr !== undefined) {
-    document.getElementById('cost-display').textContent = `Cost: ₹${Number(costInr).toFixed(5)}`;
+// ── Turn inspector ───────────────────────────────────────────────────────────
+
+/**
+ * Latency waterfall: each stage is drawn where it happened on the turn's
+ * timeline, so overlap (speech synthesis starting before the model finishes)
+ * is visible. A dashed marker shows when the caller first heard audio.
+ */
+function renderTurn(result, kind) {
+  const latency = result.latency;
+  if (!latency) return;
+  show($('turn-empty'), false);
+  show($('turn-detail'), true);
+  show($('turn-kind'), true);
+  $('turn-kind').textContent = result.is_booking ? `${kind} · booking` : kind;
+  $('turn-kind').className = 'pill plain';
+
+  const total = Math.max(Number(latency.total_ms) || 0, 1);
+  const stt = Number(latency.stt_ms) || 0;
+  const search = Number(latency.retrieval_ms) || 0;
+  const llm = Number(latency.llm_ms) || 0;
+  const tts = Number(latency.tts_ms) || 0;
+  const first = Number(latency.first_audio_ms) || 0;
+
+  const stages = [
+    ['Speech in', 'stt', 0, stt],
+    ['Search', 'search', stt, search],
+    ['Model', 'llm', stt + search, llm],
+    ['Speech out', 'tts', Math.max(total - tts, 0), tts],
+  ].filter(([, , , duration]) => duration > 0);
+
+  const rows = stages.map(([name, key, start, duration]) => {
+    const bar = el('div', { class: `wf-bar ${key}` });
+    bar.style.left = `${Math.min((start / total) * 100, 99)}%`;
+    bar.style.width = `${Math.min((duration / total) * 100, 100 - (start / total) * 100)}%`;
+    return el('div', { class: 'wf-row' },
+      el('span', { class: 'wf-name', text: name }),
+      el('div', { class: 'wf-lane' }, bar),
+      el('span', { class: 'wf-ms', text: formatMs(duration) }),
+    );
+  });
+  if (first > 0) {
+    const position = Math.min((first / total) * 100, 100);
+    const marker = el('div', { class: `wf-marker ${position > 70 ? 'flip' : ''}`.trim() }, el('span', { text: 'first audio' }));
+    marker.style.left = `${position}%`;
+    rows.push(el('div', { class: 'wf-axis' }, marker));
   }
+  setContent($('waterfall'), ...(rows.length ? rows : [el('div', { class: 'help', text: 'Answered without calling the model.' })]));
+
+  const grade = (ms) => (ms <= state.budgetMs ? 'good' : ms <= state.budgetMs * 1.3 ? 'warn' : 'bad');
+  $('val-first').textContent = first ? formatMs(first) : kind === 'Text' ? 'Text only' : 'No audio';
+  $('val-first').className = `kv-big ${first ? grade(first) : ''}`.trim();
+  $('val-total').textContent = formatMs(total);
+  $('val-cost').textContent = result.cost_inr !== undefined ? `₹${Number(result.cost_inr).toFixed(5)}` : '–';
+  $('val-budget').textContent = `${formatMs(state.budgetMs)} to first audio`;
 }
 
-// ──────────────────────────────────────────────
-// Status bar
-// ──────────────────────────────────────────────
-function showQueryStatus(show, text = '') {
-  const bar = document.getElementById('query-status');
-  const label = document.getElementById('query-status-text');
-  bar.style.display = show ? 'flex' : 'none';
-  if (text) label.textContent = text;
+// ── Knowledge base ───────────────────────────────────────────────────────────
+
+function selectSourceKind(kind) {
+  show($('source-file'), kind === 'file');
+  show($('url-form'), kind === 'url');
+  show($('text-form'), kind === 'text');
+  document.querySelectorAll('[data-action="source-kind"]').forEach((button) => {
+    const active = button.dataset.kind === kind;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
 }
 
-// ──────────────────────────────────────────────
-// Document Ingestion
-// ──────────────────────────────────────────────
-function handleDragOver(e) {
-  e.preventDefault();
-  document.getElementById('drop-zone').classList.add('dragover');
+function setIngesting(busy, text = '') {
+  show($('ingest-status'), busy);
+  if (text) $('ingest-status-text').textContent = text;
 }
-function handleDragLeave() {
-  document.getElementById('drop-zone').classList.remove('dragover');
-}
-function handleDrop(e) {
-  e.preventDefault();
-  document.getElementById('drop-zone').classList.remove('dragover');
-  const file = e.dataTransfer.files[0];
-  if (file && file.name.endsWith('.pdf')) uploadPDF(file);
-  else toast('Please drop a PDF file.', 'error');
+
+function finishIngest(result, label) {
+  setIngesting(false);
+  if (!result.ok) { toast(errorText(result, 'That source could not be added.'), 'bad'); return false; }
+  toast(`${label} added: ${plural(result.data.chunks_added, 'passage')} indexed.`);
+  loadSources();
+  return true;
 }
 
 async function uploadPDF(file) {
   if (!file) return;
-  setPDFStatus(true, `Uploading ${file.name}…`);
-  const formData = new FormData();
-  formData.append('file', file);
-  try {
-    const res = await fetch(`${API_BASE}/ingest/pdf`, { method: 'POST', body: formData });
-    const data = await res.json();
-    if (data.status === 'ok') {
-      toast(`✅ PDF ingested: ${data.chunks_added} chunks`, 'success');
-      addToHistory('PDF', file.name, data.chunks_added);
-      loadKBInfo();
-    } else {
-      toast('Ingestion failed: ' + (data.detail || 'unknown'), 'error');
-    }
-  } catch (e) {
-    toast('Upload failed: ' + e.message, 'error');
+  if (!file.name.toLowerCase().endsWith('.pdf')) { toast('Choose a PDF file.', 'bad'); return; }
+  setIngesting(true, `Uploading ${file.name}…`);
+  const form = new FormData();
+  form.append('file', file);
+  finishIngest(await api('/ingest/pdf', { method: 'POST', form, admin: true }), 'PDF');
+  $('pdf-file-input').value = '';
+}
+
+async function ingestURL(event) {
+  event.preventDefault();
+  const url = $('url-input').value.trim();
+  if (!url) return;
+  setIngesting(true, 'Fetching the page…');
+  if (finishIngest(await api('/ingest/url', { method: 'POST', body: { url }, admin: true }), 'Page')) $('url-input').value = '';
+}
+
+async function ingestText(event) {
+  event.preventDefault();
+  const text = $('text-area-input').value.trim();
+  if (!text) return;
+  const name = $('text-name-input').value.trim() || 'Pasted text';
+  setIngesting(true, 'Indexing…');
+  if (finishIngest(await api('/ingest/text', { method: 'POST', body: { text, name }, admin: true }), 'Text')) {
+    $('text-area-input').value = '';
+    $('text-name-input').value = '';
   }
-  setPDFStatus(false);
 }
 
-async function ingestURL() {
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) { toast('Please enter a URL.', 'error'); return; }
-  setPDFStatus(true, `Scraping ${url}…`);
-  try {
-    const res = await fetch(`${API_BASE}/ingest/url`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-    });
-    const data = await res.json();
-    if (data.status === 'ok') {
-      toast(`✅ URL ingested: ${data.chunks_added} chunks`, 'success');
-      addToHistory('URL', url, data.chunks_added);
-      loadKBInfo();
-      document.getElementById('url-input').value = '';
-    } else {
-      toast('Ingestion failed: ' + (data.detail || 'unknown'), 'error');
-    }
-  } catch (e) {
-    toast('URL ingest failed: ' + e.message, 'error');
-  }
-  setPDFStatus(false);
-}
-
-async function ingestText() {
-  const text = document.getElementById('text-area-input').value.trim();
-  const name = document.getElementById('text-name-input').value.trim() || 'manual_input';
-  if (!text) { toast('Please enter some text.', 'error'); return; }
-
-  setTextStatus(true, 'Ingesting text…');
-  try {
-    const res = await fetch(`${API_BASE}/ingest/text`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, name }),
-    });
-    const data = await res.json();
-    if (data.status === 'ok') {
-      toast(`✅ Text ingested: ${data.chunks_added} chunks`, 'success');
-      addToHistory('Text', name, data.chunks_added);
-      loadKBInfo();
-      document.getElementById('text-area-input').value = '';
-    } else {
-      toast('Ingestion failed: ' + (data.detail || 'unknown'), 'error');
-    }
-  } catch (e) {
-    toast('Text ingest failed: ' + e.message, 'error');
-  }
-  setTextStatus(false);
-}
-
-function setPDFStatus(show, text = '') {
-  const el = document.getElementById('pdf-status');
-  el.style.display = show ? 'flex' : 'none';
-  if (text) document.getElementById('pdf-status-text').textContent = text;
-}
-function setTextStatus(show, text = '') {
-  const el = document.getElementById('text-status');
-  el.style.display = show ? 'flex' : 'none';
-  if (text) document.getElementById('text-status-text').textContent = text;
-}
-
-function addToHistory(type, source, chunks) {
-  ingestHistory.unshift({ type, source, chunks, time: new Date().toLocaleTimeString() });
-  renderHistory();
-}
-
-function renderHistory() {
-  const el = document.getElementById('ingest-history');
-  if (ingestHistory.length === 0) {
-    el.innerHTML = '<span class="text-muted">No documents ingested yet.</span>';
+async function loadSources() {
+  const list = $('kb-sources');
+  if (!list.children.length) setContent(list, skeleton());
+  const result = await api('/kb/sources', { admin: true });
+  if (!result.ok) {
+    $('sources-count').textContent = '';
+    setContent(list, emptyNote(errorText(result, 'Sources could not be loaded.')));
     return;
   }
-  el.innerHTML = ingestHistory.map(h =>
-    `<div style="padding:8px 0; border-bottom:1px solid var(--border); font-size:0.83rem;">
-      <span style="color:var(--accent-light);">[${h.type}]</span>
-      <span style="margin:0 8px;">${h.source.length > 50 ? h.source.slice(0,50)+'…' : h.source}</span>
-      <span style="color:var(--green);">+${h.chunks} chunks</span>
-      <span style="color:var(--text-muted); float:right;">${h.time}</span>
-    </div>`
-  ).join('');
+  const sources = result.data.sources || [];
+  $('sources-count').textContent = sources.length ? `(${sources.length})` : '';
+  if (sources.length === 0) {
+    setContent(list, emptyNote('No sources yet. Add a PDF, a web page or some text and the agent can answer from it straight away.'));
+    return;
+  }
+  setContent(list, ...sources.map((item) => {
+    const isLink = /^https?:\/\//i.test(item.source);
+    return el('div', { class: 'row' },
+      el('div', { class: 'row-main' },
+        el('div', { class: 'row-title', text: item.source, title: item.source }),
+        el('div', { class: 'row-sub', text: `${isLink ? 'Web page' : item.source.toLowerCase().endsWith('.pdf') ? 'PDF' : 'Text'} · ${plural(item.chunks, 'passage')}` }),
+      ),
+      el('button', {
+        class: 'btn btn-sm btn-danger-ghost', type: 'button', text: 'Remove',
+        dataset: { action: 'delete-source', source: item.source },
+      }),
+    );
+  }));
 }
 
-// ──────────────────────────────────────────────
-// Benchmark
-// ──────────────────────────────────────────────
-async function runBenchmark() {
-  const n = parseInt(document.getElementById('bench-n').value) || 5;
-  const btn = document.getElementById('bench-btn');
-  btn.disabled = true;
+async function deleteSource(source) {
+  if (!await confirmAction('Remove this source?', `“${source}” will no longer be used to answer callers.`, 'Remove')) return;
+  const result = await api(`/kb/sources?source=${encodeURIComponent(source)}`, { method: 'DELETE', admin: true });
+  if (!result.ok) { toast(errorText(result, 'That source could not be removed.'), 'bad'); return; }
+  toast('Source removed.');
+  loadSources();
+}
 
-  document.getElementById('bench-status').style.display = 'flex';
-  document.getElementById('bench-status-text').textContent = `Running ${n} queries…`;
-  document.getElementById('bench-kpis').style.display = 'none';
-  document.getElementById('bench-comp-card').style.display = 'none';
-  document.getElementById('bench-table-card').style.display = 'none';
+async function clearKB() {
+  if (!await confirmAction('Remove every source?', 'The agent will have nothing to answer from until you add documents again. This cannot be undone.', 'Remove all')) return;
+  const result = await api('/kb/clear', { method: 'DELETE', admin: true });
+  if (!result.ok) { toast(errorText(result, 'The knowledge base could not be cleared.'), 'bad'); return; }
+  toast('Knowledge base cleared.');
+  loadSources();
+}
 
-  try {
-    const res = await fetch(`${API_BASE}/benchmark?n=${n}`);
-    const data = await res.json();
-    benchmarkData = data;
-    renderBenchmark(data);
-    document.getElementById('bench-report-btn').style.display = 'flex';
-    toast('Benchmark complete!', 'success');
-  } catch (e) {
-    toast('Benchmark failed: ' + e.message, 'error');
+// ── Appointments ─────────────────────────────────────────────────────────────
+
+function tile(label, value, tone = '') {
+  return el('div', { class: 'tile' },
+    el('div', { class: 'tile-label', text: label }),
+    el('div', { class: `tile-value ${tone}`.trim(), text: String(value) }),
+  );
+}
+
+function initBookingDate() {
+  const today = new Date();
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
+  $('book-date').min = localISODate(today);
+  $('book-date').value = localISODate(tomorrow);
+}
+
+async function loadSlots() {
+  const day = $('book-date').value;
+  const box = $('slots');
+  state.slot = '';
+  if (!day) { setContent(box, el('span', { class: 'help', text: 'Choose a date to see open times.' })); return; }
+  const result = await api(`/booking/slots?date=${encodeURIComponent(day)}`);
+  if (day !== $('book-date').value) return;                     // the date changed while loading
+  if (!result.ok) { setContent(box, el('span', { class: 'help', text: errorText(result, 'Open times could not be loaded.') })); return; }
+  const slots = result.data.available_slots || [];
+  if (slots.length === 0) { setContent(box, el('span', { class: 'help', text: 'No open times on this date.' })); return; }
+  setContent(box, ...slots.map((slot) => el('button', {
+    class: 'slot', type: 'button', role: 'radio', 'aria-checked': 'false', text: formatTime(slot),
+    dataset: { action: 'pick-slot', slot },
+  })));
+}
+
+function pickSlot(button) {
+  state.slot = button.dataset.slot;
+  document.querySelectorAll('#slots .slot').forEach((other) => other.setAttribute('aria-checked', String(other === button)));
+}
+
+async function bookAppointment(event) {
+  event.preventDefault();
+  if (!state.slot) { toast('Choose one of the open times.', 'bad'); return; }
+  const body = {
+    name: $('book-name').value.trim(),
+    email: $('book-email').value.trim(),
+    date: $('book-date').value,
+    time: state.slot,
+  };
+  $('book-btn').disabled = true;
+  const result = await api('/booking/create', { method: 'POST', body, admin: true });
+  $('book-btn').disabled = false;
+
+  if (!result.ok) {
+    setContent($('book-result'), el('div', { class: 'notice bad', text: errorText(result, 'The appointment could not be booked.') }));
+    if (result.status === 409) loadSlots();
+    return;
   }
+  const reference = result.data.ref_code ? ` Reference ${result.data.ref_code}.` : '';
+  setContent($('book-result'), el('div', { class: 'notice good', text: `${result.data.message}${reference}` }));
+  $('book-name').value = '';
+  $('book-email').value = '';
+  loadSlots();
+  loadBookingStats();
+  loadBookings();
+}
 
-  document.getElementById('bench-status').style.display = 'none';
-  btn.disabled = false;
+async function loadBookingStats() {
+  const result = await api('/booking/stats', { admin: true });
+  if (!result.ok) { setContent($('booking-stats')); return; }
+  const stats = result.data.stats || {};
+  setContent($('booking-stats'),
+    tile('Upcoming', stats.upcoming || 0),
+    tile('Confirmed', stats.confirmed || 0),
+    tile('Cancelled', stats.cancelled || 0),
+    tile('All time', stats.total || 0),
+    tile('Calendar', stats.mode === 'mock' ? 'Mock' : 'Cal.com', stats.mode === 'mock' ? 'warn' : 'good'),
+  );
+}
+
+async function loadBookings() {
+  const rows = $('booking-rows');
+  const note = $('booking-empty');
+  const query = state.bookingFilter ? `&status=${state.bookingFilter}` : '';
+  const result = await api(`/booking/history?limit=50${query}`, { admin: true });
+  if (!result.ok) {
+    setContent(rows);
+    note.textContent = errorText(result, 'Appointments could not be loaded.');
+    show(note, true);
+    return;
+  }
+  const bookings = result.data.bookings || [];
+  show(note, bookings.length === 0);
+  note.textContent = state.bookingFilter ? `No ${state.bookingFilter} appointments.` : 'No appointments yet.';
+  setContent(rows, ...bookings.map((booking) => {
+    const confirmed = booking.status === 'confirmed';
+    const action = confirmed && booking.cal_booking_uid
+      ? el('button', {
+        class: 'btn btn-sm btn-danger-ghost', type: 'button', text: 'Cancel',
+        dataset: { action: 'cancel-booking', uid: booking.cal_booking_uid, when: `${formatDate(booking.date)} at ${formatTime(booking.time_ist)}` },
+      })
+      : null;
+    return el('tr', {},
+      el('td', {}, document.createTextNode(formatDate(booking.date)), el('span', { class: 'cell-sub', text: formatTime(booking.time_ist) })),
+      el('td', { class: 'cell-wrap' }, document.createTextNode(booking.attendee_name || ''), el('span', { class: 'cell-sub', text: booking.attendee_email || '' })),
+      el('td', { class: 'mono', text: booking.ref_code || '–' }),
+      el('td', { text: booking.source || '–' }),
+      el('td', {}, pill(booking.status || 'unknown', confirmed ? 'good' : '')),
+      el('td', { class: 'num' }, action),
+    );
+  }));
+}
+
+function setBookingFilter(button) {
+  state.bookingFilter = button.dataset.status;
+  document.querySelectorAll('[data-action="booking-filter"]').forEach((other) => {
+    other.classList.toggle('active', other === button);
+    other.setAttribute('aria-selected', String(other === button));
+  });
+  loadBookings();
+}
+
+async function cancelBooking(button) {
+  if (!await confirmAction('Cancel this appointment?', `${button.dataset.when}. The attendee is notified by the calendar.`, 'Cancel appointment')) return;
+  const result = await api('/booking/cancel', { method: 'POST', body: { booking_uid: button.dataset.uid }, admin: true });
+  if (!result.ok) { toast(errorText(result, 'The appointment could not be cancelled.'), 'bad'); return; }
+  toast('Appointment cancelled.');
+  loadBookingStats();
+  loadBookings();
+  loadSlots();
+}
+
+// ── Calls ────────────────────────────────────────────────────────────────────
+
+async function loadCalls() {
+  const rows = $('call-rows');
+  const note = $('calls-empty');
+  const result = await api('/calls', { admin: true });
+  if (!result.ok) {
+    setContent(rows);
+    setContent($('call-stats'));
+    note.textContent = errorText(result, 'Calls could not be loaded.');
+    show(note, true);
+    $('calls-config-text').textContent = '';
+    return;
+  }
+  const data = result.data;
+  $('call-btn').disabled = !data.outbound_enabled;
+  $('calls-config-text').textContent = data.outbound_enabled
+    ? 'International format. The telephony worker must be running.'
+    : data.telephony_configured
+      ? 'Outbound calling needs a SIP trunk: run setup_vobiz_trunk.py and set OUTBOUND_TRUNK_ID.'
+      : 'Calling is off until the LIVEKIT and VOBIZ settings are added on the server.';
+
+  const stats = data.stats || {};
+  setContent($('call-stats'),
+    tile('Calls', stats.total || 0),
+    tile('Inbound', stats.inbound || 0),
+    tile('Outbound', stats.outbound || 0),
+    tile('Completed', stats.completed || 0),
+    tile('Not connected', stats.failed || 0, stats.failed ? 'warn' : ''),
+    tile('Talk time', formatDuration(stats.total_duration_sec)),
+  );
+
+  const calls = data.calls || [];
+  show(note, calls.length === 0);
+  note.textContent = 'No calls yet.';
+  const tones = { completed: 'good', in_progress: 'accent', ringing: 'accent', failed: 'bad' };
+  setContent(rows, ...calls.map((call) => {
+    const outbound = call.direction === 'outbound';
+    return el('tr', {},
+      el('td', {}, el('span', { class: `dir ${outbound ? 'out' : ''}`.trim(), title: outbound ? 'Outbound' : 'Inbound' }, icon(outbound ? 'out' : 'in'))),
+      el('td', { class: 'mono', text: call.phone || 'Unknown' }),
+      el('td', { text: formatTimestamp(call.created_at) }),
+      el('td', { class: 'num', text: String(call.turns || 0) }),
+      el('td', { class: 'num', text: formatDuration(call.duration_sec) }),
+      el('td', {}, pill(String(call.status || '').replace('_', ' '), tones[call.status] || ''),
+        call.detail ? el('span', { class: 'cell-sub', text: call.detail }) : null),
+    );
+  }));
+}
+
+async function placeCall(event) {
+  event.preventDefault();
+  const number = $('call-number').value.replace(/[\s().-]/g, '');
+  if (!await confirmAction('Place this call?', `The agent will phone ${number} now and start the conversation when it is answered.`, 'Call')) return;
+  $('call-btn').disabled = true;
+  const result = await api('/calls/outbound', { method: 'POST', body: { phone_number: number }, admin: true });
+  $('call-btn').disabled = false;
+  if (!result.ok) { toast(errorText(result, 'The call could not be started.'), 'bad'); return; }
+  toast('Call queued. The worker is dialling.');
+  $('call-number').value = '';
+  loadCalls();
+}
+
+// ── Evaluation ───────────────────────────────────────────────────────────────
+
+async function runBenchmark(event) {
+  event.preventDefault();
+  const count = Math.min(Math.max(parseInt($('bench-n').value, 10) || 5, 1), 20);
+  $('bench-btn').disabled = true;
+  show($('bench-status'), true);
+  $('bench-status-text').textContent = `Running ${plural(count, 'question')}…`;
+
+  const result = await api(`/benchmark?n=${count}`, { admin: true });
+  show($('bench-status'), false);
+  $('bench-btn').disabled = false;
+  if (!result.ok) { toast(errorText(result, 'The evaluation could not be run.'), 'bad'); return; }
+
+  state.benchmark = result.data;
+  renderBenchmark(result.data);
+  show($('bench-report-btn'), true);
 }
 
 function renderBenchmark(data) {
-  const lat = data.latency || {};
+  const latency = data.latency || {};
   const cost = data.cost || {};
-  const comp = lat.component_means || {};
-  const within = data.within_budget_pct || 0;
+  const accuracy = (data.accuracy || {}).mean_score || 0;
+  const budget = data.budget_ms || state.budgetMs;
+  const set = (id, text, good) => {
+    $(id).textContent = text;
+    if (good !== undefined) $(id).className = `tile-value ${good ? 'good' : 'warn'}`;
+  };
 
-  // KPIs
-  const p50El = document.getElementById('bkpi-p50');
-  p50El.textContent = `${(lat.p50_ms || 0).toFixed(0)}ms`;
-  p50El.className = `kpi-val ${lat.p50_ms <= BUDGET_MS ? 'green' : 'yellow'}`;
+  set('bkpi-p50', formatMs(latency.p50_ms), (latency.p50_ms || 0) <= budget);
+  set('bkpi-p95', formatMs(latency.p95_ms), (latency.p95_ms || 0) <= budget);
+  set('bkpi-accuracy', `${(accuracy * 100).toFixed(0)}%`, accuracy >= 0.6);
+  set('bkpi-cost', `₹${(cost.per_query_avg_inr || 0).toFixed(5)}`);
+  $('bkpi-budget-note').textContent = `Budget ${formatMs(budget)}`;
+  $('bkpi-within').textContent = `${data.within_budget_pct || 0}% within budget`;
+  $('bkpi-queries').textContent = `${data.successful || 0} of ${data.total_queries || 0} answered`;
+  $('bench-stack').textContent = (data.api_stack || {}).llm || '';
 
-  const p95El = document.getElementById('bkpi-p95');
-  p95El.textContent = `${(lat.p95_ms || 0).toFixed(0)}ms`;
-  p95El.className = `kpi-val ${lat.p95_ms <= BUDGET_MS * 1.3 ? 'green' : 'yellow'}`;
-
-  const budEl = document.getElementById('bkpi-budget');
-  budEl.textContent = `${within}%`;
-  budEl.className = `kpi-val ${within >= 80 ? 'green' : 'yellow'}`;
-
-  document.getElementById('bkpi-cost').textContent = `₹${(cost.per_query_avg_inr || 0).toFixed(5)}`;
-  document.getElementById('bkpi-cost100').textContent = `₹${(cost.per_100_queries_inr || 0).toFixed(3)} / 100 queries`;
-  document.getElementById('bkpi-queries').textContent = `${data.successful || 0}/${data.total_queries || 0}`;
-  document.getElementById('bkpi-errors').textContent = `${data.errors || 0} errors`;
-
-  // Component bars
-  const maxMs = Math.max(comp.stt_ms || 0, comp.retrieval_ms || 0, comp.llm_ms || 0, comp.tts_ms || 0, 1);
-  function compBar(id, valId, ms) {
-    const pct = Math.min((ms / BUDGET_MS) * 100, 100);
-    document.getElementById(id).style.width = `${pct}%`;
-    document.getElementById(id).textContent = `${ms.toFixed(0)}ms`;
-    document.getElementById(valId).textContent = `${ms.toFixed(0)} ms`;
-  }
-  compBar('bc-stt', 'bcv-stt', comp.stt_ms || 0);
-  compBar('bc-rag', 'bcv-rag', comp.retrieval_ms || 0);
-  compBar('bc-llm', 'bcv-llm', comp.llm_ms || 0);
-  compBar('bc-tts', 'bcv-tts', comp.tts_ms || 0);
-
-  // Table
-  const tbody = document.getElementById('bench-tbody');
-  tbody.innerHTML = '';
-  (data.individual_results || []).forEach(r => {
-    const ok = r.within_budget;
-    const tr = document.createElement('tr');
-    tr.style.borderBottom = '1px solid var(--border)';
-    tr.innerHTML = `
-      <td style="padding:9px 12px; color:${ok ? 'var(--text-primary)' : 'var(--yellow)'};">${ok ? '✅' : '⚠️'} ${r.query.slice(0, 55)}</td>
-      <td style="padding:9px 12px; text-align:right; color:var(--text-secondary);">${(r.retrieval_ms||0).toFixed(0)}</td>
-      <td style="padding:9px 12px; text-align:right; color:var(--text-secondary);">${(r.llm_ms||0).toFixed(0)}</td>
-      <td style="padding:9px 12px; text-align:right; font-weight:600; color:${ok ? 'var(--green)' : 'var(--yellow)'};">${(r.total_ms||0).toFixed(0)}</td>
-      <td style="padding:9px 12px; text-align:right; color:var(--green);">₹${(r.cost_inr||0).toFixed(5)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
-
-  document.getElementById('bench-kpis').style.display = 'grid';
-  document.getElementById('bench-comp-card').style.display = 'block';
-  document.getElementById('bench-table-card').style.display = 'block';
+  const scale = Math.max(budget, ...(data.individual_results || []).map((row) => row.total_ms || 0));
+  setContent($('bench-tbody'), ...(data.individual_results || []).map((row) => {
+    const fill = el('div', { class: `budget-fill ${row.within_budget ? '' : 'over'}`.trim() });
+    fill.style.width = `${Math.max(((row.total_ms || 0) / scale) * 100, 1)}%`;
+    return el('tr', {},
+      el('td', { class: 'cell-wrap', text: row.query }),
+      el('td', {}, el('div', { class: 'budget' }, el('div', { class: 'budget-track' }, fill))),
+      el('td', { class: 'num', text: formatMs(row.retrieval_ms) }),
+      el('td', { class: 'num', text: formatMs(row.llm_ms) }),
+      el('td', { class: 'num', text: formatMs(row.total_ms) }),
+      el('td', { class: 'num', text: `${((row.accuracy || 0) * 100).toFixed(0)}%` }),
+    );
+  }));
+  show($('bench-kpis'), true);
+  show($('bench-table-card'), true);
 }
 
 function downloadReport() {
-  if (!benchmarkData) return;
-  const json = JSON.stringify(benchmarkData, null, 2);
-  const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `benchmark_${Date.now()}.json`;
-  a.click();
+  if (!state.benchmark) return;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(state.benchmark, null, 2)], { type: 'application/json' }));
+  el('a', { href: url, download: `evaluation_${localISODate(new Date())}.json` }).click();
   URL.revokeObjectURL(url);
 }
 
-// ──────────────────────────────────────────────
-// Booking (Cal.com) — Enhanced
-// ──────────────────────────────────────────────
+// ── Wiring ───────────────────────────────────────────────────────────────────
 
-function setDefaultBookingDates() {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const dateStr = tomorrow.toISOString().split('T')[0];
+const ACTIONS = {
+  'open-nav': () => openNav(),
+  'close-nav': () => closeNav(),
+  'refresh-view': () => showView(state.view),
+  'open-settings': () => openSettings(),
+  'clear-token': () => clearToken(),
+  'cycle-theme': () => cycleTheme(),
+  'toggle-recording': () => toggleRecording(),
+  'clear-conversation': () => clearConversation(),
+  'suggest': (target) => sendText(target.textContent.trim()),
+  'source-kind': (target) => selectSourceKind(target.dataset.kind),
+  'delete-source': (target) => deleteSource(target.dataset.source),
+  'clear-kb': () => clearKB(),
+  'pick-slot': (target) => pickSlot(target),
+  'booking-filter': (target) => setBookingFilter(target),
+  'cancel-booking': (target) => cancelBooking(target),
+  'download-report': () => downloadReport(),
+};
 
-  const bookingDate = document.getElementById('booking-date');
-  const bookDate = document.getElementById('book-date');
-  if (bookingDate && !bookingDate.value) bookingDate.value = dateStr;
-  if (bookDate && !bookDate.value) bookDate.value = dateStr;
+function wireEvents() {
+  // One delegated listener covers static controls and rows rendered later.
+  document.addEventListener('click', (event) => {
+    const target = event.target.closest('[data-action]');
+    if (target && ACTIONS[target.dataset.action]) ACTIONS[target.dataset.action](target);
+  });
+  window.addEventListener('hashchange', () => showView(location.hash.slice(1)));
 
-  // Set min date to today
-  const today = new Date().toISOString().split('T')[0];
-  if (bookingDate) bookingDate.setAttribute('min', today);
-  if (bookDate) bookDate.setAttribute('min', today);
-}
-
-async function checkSlots() {
-  const dateVal = document.getElementById('booking-date').value;
-  if (!dateVal) { toast('Please select a date.', 'error'); return; }
-
-  document.getElementById('slots-status').style.display = 'flex';
-  document.getElementById('slots-result').innerHTML = '';
-
-  try {
-    const res  = await fetch(`${API_BASE}/booking/slots?date=${dateVal}`);
-    const data = await res.json();
-
-    if (data.status === 'ok') {
-      const slots = data.available_slots || [];
-      const dateObj = new Date(dateVal + 'T00:00:00');
-      const dateStr = dateObj.toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-
-      if (slots.length === 0) {
-        document.getElementById('slots-result').innerHTML =
-          `<div style="color:var(--yellow); padding:12px; background:rgba(245,158,11,0.1); border-radius:8px;">
-            ⚠️ No available slots on ${dateStr}.
-          </div>`;
-      } else {
-        const slotBtns = slots.map(s => {
-          const h = parseInt(s.split(':')[0]);
-          const ampm = h >= 12 ? 'PM' : 'AM';
-          const h12  = h > 12 ? h - 12 : (h === 0 ? 12 : h);
-          const label = `${h12}:${s.split(':')[1]} ${ampm}`;
-          return `<button class="slot-btn" onclick="selectSlot('${s}', '${dateVal}')">${label}</button>`;
-        }).join('');
-
-        document.getElementById('slots-result').innerHTML =
-          `<div style="margin-bottom:8px; color:var(--text-muted); font-size:0.82rem;">
-            ✅ ${slots.length} slot${slots.length > 1 ? 's' : ''} available on ${dateStr}:
-          </div>
-          <div class="slots-grid">${slotBtns}</div>`;
-      }
-    } else {
-      toast('Failed to fetch slots.', 'error');
+  $('admin-token-form').addEventListener('submit', saveToken);
+  $('chat-form').addEventListener('submit', submitChat);
+  $('text-input').addEventListener('input', (event) => autoGrow(event.target));
+  $('text-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      $('chat-form').requestSubmit();
     }
-  } catch (e) {
-    toast('Error: ' + e.message, 'error');
-  }
-  document.getElementById('slots-status').style.display = 'none';
+  });
+  $('url-form').addEventListener('submit', ingestURL);
+  $('text-form').addEventListener('submit', ingestText);
+  $('book-form').addEventListener('submit', bookAppointment);
+  $('book-date').addEventListener('change', loadSlots);
+  $('call-form').addEventListener('submit', placeCall);
+  $('bench-form').addEventListener('submit', runBenchmark);
+
+  const dropZone = $('drop-zone');
+  const fileInput = $('pdf-file-input');
+  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput.click(); }
+  });
+  dropZone.addEventListener('dragover', (event) => { event.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropZone.classList.remove('dragover');
+    uploadPDF(event.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => uploadPDF(fileInput.files[0]));
 }
 
-function selectSlot(time, date) {
-  // Auto-fill the booking form with selected slot
-  document.getElementById('book-date').value = date;
-  document.getElementById('book-time').value = time;
-  // Switch focus to booking form
-  document.getElementById('book-name').focus();
-  const h = parseInt(time.split(':')[0]);
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  const h12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
-  toast(`Slot ${h12}:${time.split(':')[1]} ${ampm} selected — fill in your details to confirm.`, 'info');
-}
-
-// Auto-load available slots when booking date changes
-async function autoLoadSlots() {
-  const dateVal = document.getElementById('book-date').value;
-  if (!dateVal) return;
-
-  try {
-    const res = await fetch(`${API_BASE}/booking/slots?date=${dateVal}`);
-    const data = await res.json();
-
-    if (data.status === 'ok') {
-      const slots = data.available_slots || [];
-      const select = document.getElementById('book-time');
-      select.innerHTML = '';
-
-      if (slots.length === 0) {
-        select.innerHTML = '<option value="">No slots available</option>';
-        toast('No slots available on this date.', 'warning');
-        return;
-      }
-
-      slots.forEach(s => {
-        const h = parseInt(s.split(':')[0]);
-        const min = s.split(':')[1];
-        const ampm = h >= 12 ? 'PM' : 'AM';
-        const h12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
-        const opt = document.createElement('option');
-        opt.value = s;
-        opt.textContent = `${h12}:${min} ${ampm}`;
-        select.appendChild(opt);
-      });
-
-      toast(`${slots.length} available slot${slots.length > 1 ? 's' : ''} loaded.`, 'info');
-    }
-  } catch (e) {
-    // Silently fail — slots dropdown will keep default values
-  }
-}
-
-async function bookAppointment() {
-  const name  = document.getElementById('book-name').value.trim();
-  const email = document.getElementById('book-email').value.trim();
-  const date  = document.getElementById('book-date').value;
-  const time  = document.getElementById('book-time').value;
-
-  if (!name)  { toast('Please enter your name.', 'error'); return; }
-  if (!email) { toast('Please enter your email.', 'error'); return; }
-  if (!date)  { toast('Please select a date.', 'error'); return; }
-  if (!time)  { toast('Please select a time slot.', 'error'); return; }
-
-  document.getElementById('book-status').style.display = 'flex';
-  document.getElementById('book-status-text').textContent = 'Booking your appointment…';
-  document.getElementById('book-result').innerHTML = '';
-
-  try {
-    const res  = await fetch(`${API_BASE}/booking/create`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...getAdminHeaders() },
-      body: JSON.stringify({ date, time, name, email }),
-    });
-    const data = await res.json();
-
-    if (res.status === 403) {
-      toast('Admin token required. Save it in localStorage as adminApiToken.', 'error');
-    } else if (data.status === 'ok') {
-      document.getElementById('book-result').innerHTML =
-        `<div style="color:var(--green); padding:12px; background:rgba(34,197,94,0.1); border-radius:8px;">
-          ✅ ${data.message}
-        </div>`;
-      toast('Appointment booked!', 'success');
-      // Refresh history
-      loadBookingHistory();
-      loadBookingStats();
-    } else {
-      document.getElementById('book-result').innerHTML =
-        `<div style="color:var(--red, #ef4444); padding:12px; background:rgba(239,68,68,0.1); border-radius:8px;">
-          ❌ ${data.detail || 'Booking failed.'}
-        </div>`;
-    }
-  } catch (e) {
-    toast('Booking error: ' + e.message, 'error');
-  }
-  document.getElementById('book-status').style.display = 'none';
-}
-
-async function naturalBooking() {
-  const query = document.getElementById('nl-booking-input').value.trim();
-  const name  = document.getElementById('nl-name').value.trim() || 'User';
-  const email = document.getElementById('nl-email').value.trim() || 'user@example.com';
-
-  if (!query) { toast('Please enter your booking request.', 'error'); return; }
-
-  document.getElementById('nl-status').style.display = 'flex';
-  document.getElementById('nl-result').innerHTML = '';
-
-  try {
-    const res  = await fetch(`${API_BASE}/booking/intent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, name, email }),
-    });
-    const data = await res.json();
-
-    if (data.status === 'ok') {
-      const isSuccess = data.response.toLowerCase().includes('confirmed') ||
-                        data.response.toLowerCase().includes('booked') ||
-                        data.booking_completed === true;
-      document.getElementById('nl-result').innerHTML =
-        `<div style="color:${isSuccess ? 'var(--green)' : 'var(--text-primary)'}; padding:12px; background:rgba(124,58,237,0.08); border-radius:8px; line-height:1.6;">
-          ${isSuccess ? '✅' : '📅'} ${data.response}
-        </div>`;
-      // Also show in conversation tab
-      addMessage('assistant', data.response);
-
-      if (isSuccess) {
-        loadBookingHistory();
-        loadBookingStats();
-      }
-    }
-  } catch (e) {
-    toast('Error: ' + e.message, 'error');
-  }
-  document.getElementById('nl-status').style.display = 'none';
-}
-
-// ──────────────────────────────────────────────
-// Booking Stats
-// ──────────────────────────────────────────────
-async function loadBookingStats() {
-  try {
-    const res = await fetch(`${API_BASE}/booking/stats`, {
-      headers: getAdminHeaders(),
-    });
-    if (res.status === 403) {
-      const el = document.getElementById('booking-stats');
-      if (el) el.textContent = 'Admin token required to view booking stats.';
-      return;
-    }
-    const data = await res.json();
-
-    if (data.status === 'ok') {
-      const s = data.stats || {};
-      const el = document.getElementById('booking-stats');
-      el.innerHTML = `
-        <div style="display:flex; gap:24px; flex-wrap:wrap; font-size:0.85rem;">
-          <div>
-            <span style="color:var(--text-muted);">Total:</span>
-            <strong style="color:var(--accent-light); margin-left:4px;">${s.total || 0}</strong>
-          </div>
-          <div>
-            <span style="color:var(--text-muted);">Confirmed:</span>
-            <strong style="color:var(--green); margin-left:4px;">${s.confirmed || 0}</strong>
-          </div>
-          <div>
-            <span style="color:var(--text-muted);">Cancelled:</span>
-            <strong style="color:var(--yellow); margin-left:4px;">${s.cancelled || 0}</strong>
-          </div>
-          <div>
-            <span style="color:var(--text-muted);">Upcoming:</span>
-            <strong style="color:var(--accent-light); margin-left:4px;">${s.upcoming || 0}</strong>
-          </div>
-        </div>
-      `;
-    }
-  } catch (e) {
-    document.getElementById('booking-stats').innerHTML =
-      '<span class="text-muted">Could not load booking stats.</span>';
-  }
-}
-
-// ──────────────────────────────────────────────
-// Booking History
-// ──────────────────────────────────────────────
-async function loadBookingHistory() {
-  const listEl = document.getElementById('booking-history-list');
-
-  try {
-    const res = await fetch(`${API_BASE}/booking/history?limit=20`, {
-      headers: getAdminHeaders(),
-    });
-    if (res.status === 403) {
-      listEl.innerHTML = '<span class="text-muted">Admin token required to view booking history.</span>';
-      return;
-    }
-    const data = await res.json();
-
-    if (data.status === 'ok') {
-      const bookings = data.bookings || [];
-
-      if (bookings.length === 0) {
-        listEl.innerHTML = '<span class="text-muted">No bookings yet. Book your first appointment above!</span>';
-        return;
-      }
-
-      listEl.innerHTML = bookings.map(b => {
-        const statusColor = b.status === 'confirmed' ? 'var(--green)' :
-                           b.status === 'cancelled' ? 'var(--yellow)' : 'var(--text-muted)';
-        const statusIcon = b.status === 'confirmed' ? '✅' :
-                          b.status === 'cancelled' ? '❌' : '⏸';
-        const dateObj = new Date(b.date + 'T00:00:00');
-        const dateStr = dateObj.toLocaleDateString('en-IN', {
-          weekday: 'short', year: 'numeric', month: 'short', day: 'numeric'
-        });
-        const h = parseInt((b.time_ist || '09:00').split(':')[0]);
-        const min = (b.time_ist || '09:00').split(':')[1];
-        const ampm = h >= 12 ? 'PM' : 'AM';
-        const h12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
-        const timeStr = `${h12}:${min} ${ampm}`;
-
-        const cancelBtn = b.status === 'confirmed' && b.cal_booking_uid
-          ? `<button class="btn btn-danger btn-sm" style="padding:2px 8px; font-size:0.75rem; margin-left:8px;"
-               onclick="cancelBooking('${b.cal_booking_uid}')">Cancel</button>`
-          : '';
-
-        return `
-          <div style="padding:10px 0; border-bottom:1px solid var(--border); font-size:0.83rem; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-            <div>
-              <span style="color:${statusColor}; font-weight:600;">${statusIcon} ${b.status.toUpperCase()}</span>
-              <span style="margin:0 8px; color:var(--text-primary);">${dateStr} at ${timeStr}</span>
-            </div>
-            <div>
-              <span style="color:var(--text-secondary);">${b.attendee_name}</span>
-              <span style="color:var(--text-muted); margin:0 6px;">·</span>
-              <span style="color:var(--text-muted); font-size:0.78rem;">${b.attendee_email}</span>
-              ${cancelBtn}
-            </div>
-          </div>
-        `;
-      }).join('');
-    } else {
-      listEl.innerHTML = '<span class="text-muted">Failed to load booking history.</span>';
-    }
-  } catch (e) {
-    listEl.innerHTML = '<span class="text-muted">Could not connect to server.</span>';
-  }
-}
-
-// ──────────────────────────────────────────────
-// Cancel Booking
-// ──────────────────────────────────────────────
-async function cancelBooking(bookingUid) {
-  if (!confirm('Are you sure you want to cancel this booking?')) return;
-
-  try {
-    const res = await fetch(`${API_BASE}/booking/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...getAdminHeaders() },
-      body: JSON.stringify({ booking_uid: bookingUid }),
-    });
-    const data = await res.json();
-
-    if (res.status === 403) {
-      toast('Admin token required. Save it in localStorage as adminApiToken.', 'error');
-    } else if (data.status === 'ok') {
-      toast('Booking cancelled successfully.', 'success');
-      loadBookingHistory();
-      loadBookingStats();
-    } else {
-      toast('Cancel failed: ' + (data.detail || data.message || 'Unknown error'), 'error');
-    }
-  } catch (e) {
-    toast('Cancel error: ' + e.message, 'error');
-  }
-}
-
-// ──────────────────────────────────────────────
-// Toast notifications
-// ──────────────────────────────────────────────
-function toast(message, type = 'info') {
-  const container = document.getElementById('toast-container');
-  const icons = { success: '✅', error: '❌', info: '💡', warning: '⚠️' };
-  const div = document.createElement('div');
-  div.className = `toast ${type}`;
-  div.innerHTML = `<span>${icons[type] || '💡'}</span><span>${message}</span>`;
-  container.appendChild(div);
-  setTimeout(() => {
-    div.style.transition = '0.3s ease';
-    div.style.opacity = '0';
-    div.style.transform = 'translateX(20px)';
-    setTimeout(() => div.remove(), 300);
-  }, 3500);
-}
+document.addEventListener('DOMContentLoaded', () => {
+  applyTheme(currentTheme());
+  buildMeter();
+  wireEvents();
+  initBookingDate();
+  connectWebSocket();
+  showView(location.hash.slice(1) || 'overview');
+  setInterval(() => { if (state.view === 'overview') loadOverview(); else checkHealth(); }, 60000);
+});

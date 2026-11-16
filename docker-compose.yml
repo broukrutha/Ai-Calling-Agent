@@ -1,0 +1,29 @@
+# docker compose up --build
+# Web console + API on http://localhost:8001. The telephony worker starts only
+# with:  docker compose --profile telephony up
+services:
+  web:
+    build: .
+    env_file: .env
+    environment:
+      APP_ENV: production
+      HOST: 0.0.0.0
+    ports:
+      - "8001:8001"
+    volumes:
+      - agent-data:/data
+    restart: unless-stopped
+
+  telephony:
+    build: .
+    profiles: ["telephony"]
+    command: ["python", "telephony_vobiz.py", "start"]
+    env_file: .env
+    volumes:
+      - agent-data:/data          # shares bookings, call log and knowledge base with web
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+
+volumes:
+  agent-data:

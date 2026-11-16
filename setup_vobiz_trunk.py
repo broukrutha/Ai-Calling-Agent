@@ -1,114 +1,72 @@
 """
-setup_vobiz_trunk.py – One-time setup to create/update your Vobiz SIP trunk in LiveKit.
+One-time setup: register your Vobiz SIP trunk with LiveKit for outbound calls.
 
-Run this ONCE after you have your Vobiz and LiveKit credentials:
-  python setup_vobiz_trunk.py
+    python setup_vobiz_trunk.py
 
-What it does:
-  1. Creates an outbound SIP trunk in LiveKit Cloud
-  2. Configures it with your Vobiz SIP credentials
-  3. Prints the TRUNK_ID — add this to your .env as OUTBOUND_TRUNK_ID
+Creates the trunk (or updates it, if OUTBOUND_TRUNK_ID is already set) and
+prints the trunk id to put in ``.env``.
 """
 
 import asyncio
-import os
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from voice_agent import config
 
 
-async def setup_trunk():
-    """Create or update a Vobiz SIP trunk in LiveKit."""
-
+async def setup_trunk() -> int:
     try:
         from livekit import api
     except ImportError:
-        print("❌ LiveKit SDK not installed!")
-        print("Run: pip install livekit-api")
-        return
+        print("Error: the LiveKit SDK is not installed. Run: pip install -r requirements.txt")
+        return 1
 
-    # Load credentials
-    livekit_url    = os.getenv("LIVEKIT_URL", "")
-    livekit_key    = os.getenv("LIVEKIT_API_KEY", "")
-    livekit_secret = os.getenv("LIVEKIT_API_SECRET", "")
+    if not config.telephony_configured():
+        print("Error: set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in .env first.")
+        return 1
+    if not config.VOBIZ_SIP_DOMAIN:
+        print("Error: set VOBIZ_SIP_DOMAIN in .env (Vobiz Console → SIP Trunk Settings).")
+        return 1
 
-    if not all([livekit_url, livekit_key, livekit_secret]):
-        print("❌ Missing LiveKit credentials in .env!")
-        print("Required: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET")
-        return
+    numbers = [config.VOBIZ_OUTBOUND_NUMBER] if config.VOBIZ_OUTBOUND_NUMBER else []
+    print("Vobiz SIP trunk")
+    print(f"  Domain:   {config.VOBIZ_SIP_DOMAIN}")
+    print(f"  Username: {config.VOBIZ_USERNAME or '(none)'}")
+    print(f"  Number:   {config.VOBIZ_OUTBOUND_NUMBER or '(none)'}")
 
-    sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
-    username   = os.getenv("VOBIZ_USERNAME", "")
-    password   = os.getenv("VOBIZ_PASSWORD", "")
-    number     = os.getenv("VOBIZ_OUTBOUND_NUMBER", "")
-    trunk_id   = os.getenv("OUTBOUND_TRUNK_ID", "")
-
-    if not sip_domain:
-        print("❌ VOBIZ_SIP_DOMAIN not set in .env!")
-        print("Get this from your Vobiz Console → SIP Trunk Settings")
-        return
-
-    print(f"📞 Vobiz SIP Trunk Setup")
-    print(f"   Domain:   {sip_domain}")
-    print(f"   Username: {username}")
-    print(f"   Number:   {number}")
-    print(f"   Trunk ID: {trunk_id or '(will create new)'}")
-    print()
-
-    # Initialize LiveKit API
-    lk = api.LiveKitAPI(
-        url=livekit_url,
-        api_key=livekit_key,
-        api_secret=livekit_secret,
+    client = api.LiveKitAPI(
+        url=config.LIVEKIT_URL, api_key=config.LIVEKIT_API_KEY, api_secret=config.LIVEKIT_API_SECRET
     )
-
     try:
-        if trunk_id:
-            # Update existing trunk
-            print(f"Updating existing trunk: {trunk_id}")
-            await lk.sip.update_outbound_trunk_fields(
-                trunk_id,
-                address=sip_domain,
-                auth_username=username,
-                auth_password=password,
-                numbers=[number] if number else [],
+        if config.OUTBOUND_TRUNK_ID:
+            await client.sip.update_outbound_trunk_fields(
+                config.OUTBOUND_TRUNK_ID,
+                address=config.VOBIZ_SIP_DOMAIN,
+                auth_username=config.VOBIZ_USERNAME,
+                auth_password=config.VOBIZ_PASSWORD,
+                numbers=numbers,
             )
-            print(f"\n✅ SIP Trunk updated successfully!")
+            print(f"\nTrunk {config.OUTBOUND_TRUNK_ID} updated.")
         else:
-            # Create new trunk
-            print("Creating new outbound SIP trunk...")
-
-            from livekit.protocol import sip as sip_proto
-
-            trunk_request = sip_proto.CreateSIPOutboundTrunkRequest(
-                trunk=sip_proto.SIPOutboundTrunkInfo(
-                    name="Vobiz Outbound",
-                    address=sip_domain,
-                    numbers=[number] if number else [],
-                    auth_username=username,
-                    auth_password=password,
+            trunk = await client.sip.create_sip_outbound_trunk(
+                api.CreateSIPOutboundTrunkRequest(
+                    trunk=api.SIPOutboundTrunkInfo(
+                        name="Vobiz Outbound",
+                        address=config.VOBIZ_SIP_DOMAIN,
+                        numbers=numbers,
+                        auth_username=config.VOBIZ_USERNAME,
+                        auth_password=config.VOBIZ_PASSWORD,
+                    )
                 )
             )
-
-            result = await lk.sip.create_sip_outbound_trunk(trunk_request)
-            new_trunk_id = result.sip_trunk_id
-
-            print(f"\n✅ SIP Trunk created successfully!")
-            print(f"   Trunk ID: {new_trunk_id}")
-            print()
-            print(f"⚠️  Add this to your .env file:")
-            print(f"   OUTBOUND_TRUNK_ID={new_trunk_id}")
-
-    except Exception as e:
-        print(f"\n❌ Failed: {e}")
-        print()
-        print("If you get 'not found' errors, make sure to enable SIP in your")
-        print("LiveKit Cloud project settings at https://cloud.livekit.io")
-
+            print("\nTrunk created. Add this line to your .env:")
+            print(f"  OUTBOUND_TRUNK_ID={trunk.sip_trunk_id}")
+    except Exception as exc:
+        print(f"\nError: {exc}")
+        print("If this is a 'not found' error, enable SIP for your project at https://cloud.livekit.io")
+        return 1
     finally:
-        await lk.aclose()
+        await client.aclose()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(setup_trunk())
+    raise SystemExit(asyncio.run(setup_trunk()))

@@ -1,0 +1,33 @@
+[project]
+name = "ai-calling-agent"
+version = "3.0.0"
+description = "AI voice agent for phone and web: speech-to-text, RAG, LLM, text-to-speech and appointment booking."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["chroma_db"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "ASYNC", "S"]
+ignore = [
+    "E501",    # line length is handled by the formatter's judgement, not the linter
+    "S101",    # asserts document invariants and are used throughout the tests
+    "SIM108",  # ternaries are not always clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108"]
+"scripts/*" = ["S"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI declares dependencies and parameters through default values.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.File"]

@@ -1,443 +1,398 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sarvam AI Voice Agent — RAG-Powered Voice Assistant</title>
-  <meta name="description" content="Low-latency AI Voice Agent powered by Sarvam AI APIs (Saaras v3, Sarvam-M, Bulbul v3) with RAG document retrieval and Cal.com booking integration." />
+  <title>Calling Agent Console</title>
+  <meta name="description" content="Operate your AI calling agent: live conversations, knowledge base, appointments, phone calls and evaluation." />
+  <meta name="color-scheme" content="light dark" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232952e3'/%3E%3Cpath d='M9 13v6M13 9v14M17 12v8M21 10v12M25 14v4' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 
-<div class="app-container">
+<!-- Icon sprite (stroke icons, 24×24 grid) -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h13v15H6a2 2 0 0 0-2 2z"/><path d="M4 20a2 2 0 0 0 2 2h13v-4M8 7h7M8 11h5"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><path d="M5 3h4l2 5-2.5 1.5a11 11 0 0 0 6 6L16 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 5a2 2 0 0 1 2-2z"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1 1 16 0"/><path d="M12 13l4-5"/><circle cx="12" cy="14" r="1.4"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.3-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.5L20 16M20 20v-4h-4"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></symbol>
+  <symbol id="i-in" viewBox="0 0 24 24"><path d="M17 7L7 17M7 9v8h8"/></symbol>
+  <symbol id="i-out" viewBox="0 0 24 24"><path d="M7 17L17 7M9 7h8v8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+</svg>
 
-  <!-- ── Header ── -->
-  <header class="app-header">
-    <div class="header-brand">
-      <div class="brand-icon">🎙️</div>
-      <div class="brand-text">
-        <h1>Sarvam Voice Agent</h1>
-        <p>RAG-Powered · Low-Latency · Sarvam AI</p>
-      </div>
-    </div>
-    <div class="header-status">
-      <div class="status-badge" id="api-status-badge">
-        <div class="status-dot" id="api-dot"></div>
-        <span id="api-status-text">Connecting…</span>
-      </div>
-      <button class="btn btn-secondary btn-sm" id="refresh-btn" onclick="checkHealth()">⟳ Refresh</button>
-    </div>
-  </header>
+<div class="shell">
 
-  <!-- ── Tabs ── -->
-  <div class="tabs" role="tablist">
-    <button class="tab-btn active" id="tab-voice" onclick="switchTab('voice')" role="tab">🎤 Voice Chat</button>
-    <button class="tab-btn" id="tab-docs" onclick="switchTab('docs')" role="tab">📄 Documents</button>
-    <button class="tab-btn" id="tab-booking" onclick="switchTab('booking')" role="tab">📅 Booking</button>
-    <button class="tab-btn" id="tab-bench" onclick="switchTab('bench')" role="tab">📊 Benchmark</button>
+  <aside class="sidebar" id="sidebar" aria-label="Main">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <span class="brand-name">Calling Agent</span>
+      <span class="brand-version" id="app-version"></span>
+    </div>
+
+    <nav class="nav" aria-label="Sections">
+      <a class="nav-item" href="#overview" data-view="overview"><svg class="icon"><use href="#i-overview"/></svg>Overview</a>
+      <a class="nav-item" href="#playground" data-view="playground"><svg class="icon"><use href="#i-mic"/></svg>Playground</a>
+      <a class="nav-item" href="#knowledge" data-view="knowledge"><svg class="icon"><use href="#i-book"/></svg>Knowledge base</a>
+      <a class="nav-item" href="#appointments" data-view="appointments"><svg class="icon"><use href="#i-calendar"/></svg>Appointments</a>
+      <a class="nav-item" href="#calls" data-view="calls"><svg class="icon"><use href="#i-phone"/></svg>Calls</a>
+      <a class="nav-item" href="#evaluation" data-view="evaluation"><svg class="icon"><use href="#i-gauge"/></svg>Evaluation</a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="conn" role="status" aria-live="polite">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">Connecting…</span>
+      </div>
+      <button class="nav-item" type="button" data-action="open-settings"><svg class="icon"><use href="#i-settings"/></svg>Settings</button>
+      <button class="nav-item" type="button" data-action="cycle-theme"><svg class="icon"><use href="#i-sun"/></svg><span id="theme-label">Theme: System</span></button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" data-action="close-nav" hidden></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" type="button" data-action="open-nav" aria-label="Open navigation"><svg class="icon"><use href="#i-menu"/></svg></button>
+      <div class="topbar-title">
+        <h1 id="view-title">Overview</h1>
+        <p id="view-subtitle"></p>
+      </div>
+      <button class="btn" type="button" data-action="refresh-view"><svg class="icon"><use href="#i-refresh"/></svg>Refresh</button>
+    </header>
+
+    <div class="banner" id="lock-banner" hidden>
+      <svg class="icon"><use href="#i-lock"/></svg>
+      <span>Activity, documents and bookings are protected. Enter the admin token to manage them.</span>
+      <button class="btn btn-sm" type="button" data-action="open-settings">Enter token</button>
+    </div>
+
+    <main class="content">
+
+      <!-- ═══════════ Overview ═══════════ -->
+      <section class="view" id="view-overview" data-title="Overview" data-subtitle="Health and activity of your calling agent at a glance.">
+        <div class="tiles" id="overview-tiles">
+          <div class="tile"><div class="tile-label">Calls handled</div><div class="tile-value" id="tile-calls">–</div><div class="tile-foot" id="tile-calls-foot">&nbsp;</div></div>
+          <div class="tile"><div class="tile-label">Talk time</div><div class="tile-value" id="tile-talk">–</div><div class="tile-foot" id="tile-talk-foot">&nbsp;</div></div>
+          <div class="tile"><div class="tile-label">Upcoming appointments</div><div class="tile-value" id="tile-upcoming">–</div><div class="tile-foot" id="tile-upcoming-foot">&nbsp;</div></div>
+          <div class="tile"><div class="tile-label">Knowledge base</div><div class="tile-value" id="tile-kb">–</div><div class="tile-foot" id="tile-kb-foot">&nbsp;</div></div>
+        </div>
+
+        <div class="grid-2-1">
+          <div class="stack">
+            <div class="panel">
+              <div class="panel-head"><h2>Recent calls</h2><a class="link" href="#calls">All calls</a></div>
+              <div id="overview-calls" class="rows"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><h2>Next appointments</h2><a class="link" href="#appointments">All appointments</a></div>
+              <div id="overview-appointments" class="rows"></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>System status</h2><span class="pill" id="overview-env"></span></div>
+            <ul class="status-list" id="status-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ Playground ═══════════ -->
+      <section class="view" id="view-playground" data-title="Playground" data-subtitle="Talk or type to the agent exactly as a caller would, and inspect every turn." hidden>
+        <div class="grid-chat">
+          <div class="panel chat">
+            <div class="panel-head">
+              <h2>Conversation</h2>
+              <button class="btn btn-sm btn-ghost" type="button" data-action="clear-conversation">Clear</button>
+            </div>
+
+            <div class="transcript" id="conversation" role="log" aria-live="polite" aria-label="Conversation">
+              <div class="empty" id="chat-empty">
+                <p class="empty-title">Start a conversation</p>
+                <p class="empty-text">The agent answers from your knowledge base and can book or cancel appointments.</p>
+                <div class="suggestions">
+                  <button class="chip" type="button" data-action="suggest">What are your opening hours?</button>
+                  <button class="chip" type="button" data-action="suggest">Book an appointment tomorrow at 2 PM</button>
+                  <button class="chip" type="button" data-action="suggest">I need to cancel my appointment</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="thinking" id="query-status" hidden><span class="spinner"></span><span id="query-status-text">Thinking…</span></div>
+
+            <form class="composer" id="chat-form">
+              <div class="composer-live" id="composer-live" hidden>
+                <span class="rec-dot"></span>
+                <span id="rec-timer">0:00</span>
+                <div class="meter" id="meter" aria-hidden="true"></div>
+                <span class="composer-hint">Listening. Press the button again to send.</span>
+              </div>
+              <textarea id="text-input" rows="1" maxlength="1000" placeholder="Type a message, or use the microphone" aria-label="Message"></textarea>
+              <button class="icon-btn mic" type="button" id="mic-btn" data-action="toggle-recording" aria-label="Start recording" aria-pressed="false">
+                <svg class="icon icon-mic"><use href="#i-mic"/></svg><svg class="icon icon-stop"><use href="#i-stop"/></svg>
+              </button>
+              <button class="btn btn-primary" type="submit" id="send-btn"><svg class="icon"><use href="#i-send"/></svg>Send</button>
+            </form>
+          </div>
+
+          <div class="stack">
+            <div class="panel">
+              <div class="panel-head"><h2>Last turn</h2><span class="pill" id="turn-kind" hidden></span></div>
+              <div class="empty-inline" id="turn-empty">Latency and cost appear here after the agent replies.</div>
+              <div id="turn-detail" hidden>
+                <div class="kv-hero">
+                  <div><div class="tile-label">Time to first audio</div><div class="kv-big" id="val-first">–</div></div>
+                  <div><div class="tile-label">Whole turn</div><div class="kv-big" id="val-total">–</div></div>
+                </div>
+                <div class="waterfall" id="waterfall" role="img" aria-label="Where the time went in the last turn"></div>
+                <dl class="kv">
+                  <dt>Estimated cost</dt><dd id="val-cost">–</dd>
+                  <dt>Budget</dt><dd id="val-budget">–</dd>
+                </dl>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-head"><h2>Session</h2></div>
+              <div class="field">
+                <label for="language-select">Caller's language</label>
+                <select id="language-select">
+                  <option value="unknown">Detect automatically</option>
+                  <option value="en-IN">English</option>
+                  <option value="hi-IN">Hindi</option>
+                  <option value="te-IN">Telugu</option>
+                  <option value="ta-IN">Tamil</option>
+                  <option value="kn-IN">Kannada</option>
+                  <option value="ml-IN">Malayalam</option>
+                  <option value="bn-IN">Bengali</option>
+                  <option value="gu-IN">Gujarati</option>
+                  <option value="mr-IN">Marathi</option>
+                  <option value="pa-IN">Punjabi</option>
+                </select>
+              </div>
+              <dl class="kv">
+                <dt>Language model</dt><dd id="session-llm">–</dd>
+                <dt>Speech</dt><dd id="session-speech">–</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ Knowledge base ═══════════ -->
+      <section class="view" id="view-knowledge" data-title="Knowledge base" data-subtitle="The documents the agent is allowed to answer from." hidden>
+        <div class="grid-1-2">
+          <div class="panel">
+            <div class="panel-head"><h2>Add a source</h2></div>
+            <div class="segmented" role="tablist" aria-label="Source type">
+              <button type="button" role="tab" class="seg active" data-action="source-kind" data-kind="file" aria-selected="true">PDF</button>
+              <button type="button" role="tab" class="seg" data-action="source-kind" data-kind="url" aria-selected="false">Web page</button>
+              <button type="button" role="tab" class="seg" data-action="source-kind" data-kind="text" aria-selected="false">Text</button>
+            </div>
+
+            <div id="source-file">
+              <div class="drop" id="drop-zone" role="button" tabindex="0" aria-label="Upload a PDF">
+                <svg class="icon icon-lg"><use href="#i-upload"/></svg>
+                <span class="drop-title">Drop a PDF here or browse</span>
+                <span class="drop-sub">Text PDFs up to 20 MB. Scanned pages need OCR first.</span>
+              </div>
+              <input type="file" id="pdf-file-input" accept="application/pdf,.pdf" hidden />
+            </div>
+
+            <form id="url-form" hidden>
+              <div class="field">
+                <label for="url-input">Page address</label>
+                <input type="url" id="url-input" placeholder="https://example.com/pricing" required />
+                <p class="help">Public pages only. The readable text is extracted and indexed.</p>
+              </div>
+              <button class="btn btn-primary btn-block" type="submit">Add page</button>
+            </form>
+
+            <form id="text-form" hidden>
+              <div class="field">
+                <label for="text-name-input">Name</label>
+                <input type="text" id="text-name-input" maxlength="200" placeholder="Clinic FAQ" />
+              </div>
+              <div class="field">
+                <label for="text-area-input">Content</label>
+                <textarea id="text-area-input" rows="7" placeholder="Paste FAQs, prices, policies, opening hours…" required></textarea>
+              </div>
+              <button class="btn btn-primary btn-block" type="submit">Add text</button>
+            </form>
+
+            <div class="thinking" id="ingest-status" hidden><span class="spinner"></span><span id="ingest-status-text">Indexing…</span></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Sources <span class="count" id="sources-count"></span></h2>
+              <button class="btn btn-sm btn-danger-ghost" type="button" data-action="clear-kb">Remove all</button>
+            </div>
+            <div id="kb-sources" class="rows"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ Appointments ═══════════ -->
+      <section class="view" id="view-appointments" data-title="Appointments" data-subtitle="Bookings made by callers, chat and your team." hidden>
+        <div class="tiles tiles-compact" id="booking-stats"></div>
+
+        <div class="grid-1-2">
+          <div class="panel">
+            <div class="panel-head"><h2>New appointment</h2></div>
+            <form id="book-form">
+              <div class="field">
+                <label for="book-date">Date</label>
+                <input type="date" id="book-date" required />
+              </div>
+              <div class="field">
+                <span class="label" id="slots-label">Open times</span>
+                <div class="slots" id="slots" role="radiogroup" aria-labelledby="slots-label"></div>
+              </div>
+              <div class="field">
+                <label for="book-name">Name</label>
+                <input type="text" id="book-name" maxlength="100" autocomplete="off" placeholder="Rahul Sharma" required />
+              </div>
+              <div class="field">
+                <label for="book-email">Email</label>
+                <input type="email" id="book-email" maxlength="254" autocomplete="off" placeholder="rahul@example.com" required />
+              </div>
+              <button class="btn btn-primary btn-block" type="submit" id="book-btn">Book appointment</button>
+            </form>
+            <div id="book-result"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>All appointments</h2>
+              <div class="segmented segmented-sm" role="tablist" aria-label="Filter">
+                <button type="button" role="tab" class="seg active" data-action="booking-filter" data-status="" aria-selected="true">All</button>
+                <button type="button" role="tab" class="seg" data-action="booking-filter" data-status="confirmed" aria-selected="false">Confirmed</button>
+                <button type="button" role="tab" class="seg" data-action="booking-filter" data-status="cancelled" aria-selected="false">Cancelled</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>When</th><th>Attendee</th><th>Reference</th><th>Source</th><th>Status</th><th></th></tr></thead>
+                <tbody id="booking-rows"></tbody>
+              </table>
+            </div>
+            <div class="empty-inline" id="booking-empty" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ Calls ═══════════ -->
+      <section class="view" id="view-calls" data-title="Calls" data-subtitle="Phone conversations handled by the telephony worker." hidden>
+        <div class="tiles tiles-compact" id="call-stats"></div>
+
+        <div class="grid-1-2">
+          <div class="panel">
+            <div class="panel-head"><h2>Place a call</h2></div>
+            <form id="call-form">
+              <div class="field">
+                <label for="call-number">Phone number</label>
+                <input type="tel" id="call-number" class="mono" placeholder="+919988776655" pattern="\+[1-9][0-9 ()\-]{7,20}" title="International format, starting with + and the country code" required />
+                <p class="help" id="calls-config-text">Checking telephony…</p>
+              </div>
+              <button class="btn btn-primary btn-block" type="submit" id="call-btn"><svg class="icon"><use href="#i-phone"/></svg>Call now</button>
+            </form>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Call log</h2></div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>Direction</th><th>Number</th><th>Started</th><th class="num">Turns</th><th class="num">Duration</th><th>Outcome</th></tr></thead>
+                <tbody id="call-rows"></tbody>
+              </table>
+            </div>
+            <div class="empty-inline" id="calls-empty" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ Evaluation ═══════════ -->
+      <section class="view" id="view-evaluation" data-title="Evaluation" data-subtitle="Measure answer speed, cost and accuracy against a fixed question set." hidden>
+        <div class="panel">
+          <form id="bench-form" class="inline-form">
+            <div class="field">
+              <label for="bench-n">Questions</label>
+              <input type="number" id="bench-n" value="5" min="1" max="20" />
+            </div>
+            <button class="btn btn-primary" type="submit" id="bench-btn">Run evaluation</button>
+            <button class="btn" type="button" id="bench-report-btn" data-action="download-report" hidden>Download JSON</button>
+            <p class="help grow">Questions go through search and the language model. Speech is measured in the Playground.</p>
+          </form>
+          <div class="thinking" id="bench-status" hidden><span class="spinner"></span><span id="bench-status-text">Running…</span></div>
+        </div>
+
+        <div class="tiles" id="bench-kpis" hidden>
+          <div class="tile"><div class="tile-label">Median latency</div><div class="tile-value" id="bkpi-p50">–</div><div class="tile-foot" id="bkpi-budget-note"></div></div>
+          <div class="tile"><div class="tile-label">95th percentile</div><div class="tile-value" id="bkpi-p95">–</div><div class="tile-foot" id="bkpi-within"></div></div>
+          <div class="tile"><div class="tile-label">Answer accuracy</div><div class="tile-value" id="bkpi-accuracy">–</div><div class="tile-foot">Expected facts present</div></div>
+          <div class="tile"><div class="tile-label">Cost per question</div><div class="tile-value" id="bkpi-cost">–</div><div class="tile-foot" id="bkpi-queries"></div></div>
+        </div>
+
+        <div class="panel" id="bench-table-card" hidden>
+          <div class="panel-head"><h2>Results</h2><span class="help" id="bench-stack"></span></div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>Question</th><th>Latency against budget</th><th class="num">Search</th><th class="num">Model</th><th class="num">Total</th><th class="num">Accuracy</th></tr></thead>
+              <tbody id="bench-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
   </div>
+</div>
 
-  <!-- ══════════════════════════════════════════
-       TAB 1: VOICE CHAT
-  ══════════════════════════════════════════ -->
-  <div class="tab-panel active" id="panel-voice">
-    <div class="voice-grid">
-
-      <!-- Left: mic + waveform -->
-      <div class="card">
-        <div class="card-title">🎙 Voice Interaction</div>
-        <div class="voice-center">
-
-          <!-- Waveform -->
-          <div class="waveform-container" id="waveform">
-            <!-- bars injected by JS -->
-          </div>
-
-          <!-- Mic button with rings -->
-          <div class="mic-button-wrap">
-            <div class="ring ring-1"></div>
-            <div class="ring ring-2"></div>
-            <div class="ring ring-3"></div>
-            <button class="mic-button" id="mic-btn" onclick="toggleRecording()" title="Click to record">
-              🎤
-            </button>
-          </div>
-          <p class="mic-hint" id="mic-hint">Click mic to start recording</p>
-
-          <!-- Audio playback -->
-          <audio id="response-audio" class="audio-player" controls style="display:none;"></audio>
-
-          <!-- Latency Breakdown -->
-          <div class="latency-display" id="latency-display" style="display:none; width:100%;">
-            <div class="latency-title">⏱ Latency Breakdown</div>
-            <div class="latency-row">
-              <div class="lat-label">STT</div>
-              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-stt" id="bar-stt" style="width:0%"></div></div>
-              <div class="lat-val" id="val-stt">—</div>
-            </div>
-            <div class="latency-row">
-              <div class="lat-label">RAG</div>
-              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-rag" id="bar-rag" style="width:0%"></div></div>
-              <div class="lat-val" id="val-rag">—</div>
-            </div>
-            <div class="latency-row">
-              <div class="lat-label">LLM</div>
-              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-llm" id="bar-llm" style="width:0%"></div></div>
-              <div class="lat-val" id="val-llm">—</div>
-            </div>
-            <div class="latency-row">
-              <div class="lat-label">TTS</div>
-              <div class="lat-bar-track"><div class="lat-bar-fill lat-bar-tts" id="bar-tts" style="width:0%"></div></div>
-              <div class="lat-val" id="val-tts">—</div>
-            </div>
-            <div class="total-latency">
-              <span>Total End-to-End</span>
-              <span class="val" id="val-total">—</span>
-            </div>
-            <div class="text-muted mt-8" id="cost-display"></div>
-          </div>
-
-        </div>
-      </div>
-
-      <!-- Right: Conversation -->
-      <div class="card" style="display:flex; flex-direction:column;">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
-          <div class="card-title" style="margin-bottom:0">💬 Conversation</div>
-          <button class="btn btn-secondary btn-sm" onclick="clearConversation()">Clear</button>
-        </div>
-
-        <div class="conversation" id="conversation">
-          <div class="message system">
-            <div>👋 Hello! Ask me anything about your documents, or say "Book an appointment".</div>
-            <div style="margin-top:4px;">Type below or use the mic →</div>
-          </div>
-        </div>
-
-        <!-- Text input -->
-        <div class="input-row mt-16">
-          <textarea class="text-input" id="text-input" rows="2"
-            placeholder="Or type your question here…"
-            onkeydown="handleKeyDown(event)"></textarea>
-          <button class="btn btn-primary" id="send-btn" onclick="sendTextQuery()">
-            Send
-          </button>
-        </div>
-
-        <div class="status-bar" id="query-status" style="display:none;">
-          <div class="spinner"></div>
-          <span id="query-status-text">Processing…</span>
-        </div>
-      </div>
-
-    </div><!-- end voice-grid -->
-
-    <!-- KB info strip -->
-    <div class="card mt-20">
-      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-        <div>
-          <div class="card-title" style="margin-bottom:4px;">📦 Knowledge Base</div>
-          <div class="text-muted" id="kb-info-text">Loading…</div>
-        </div>
-        <div style="display:flex; gap:8px;">
-          <button class="btn btn-secondary btn-sm" onclick="switchTab('docs')">+ Add Docs</button>
-          <button class="btn btn-danger btn-sm" onclick="clearKB()">🗑 Clear KB</button>
-        </div>
-      </div>
+<!-- Settings -->
+<dialog class="dialog" id="settings-dialog" aria-labelledby="settings-title">
+  <form method="dialog" class="dialog-head">
+    <h2 id="settings-title">Settings</h2>
+    <button class="icon-btn" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg></button>
+  </form>
+  <form id="admin-token-form" autocomplete="off">
+    <div class="field">
+      <label for="admin-token-input">Admin token</label>
+      <input type="password" id="admin-token-input" placeholder="Paste the server's ADMIN_API_TOKEN" autocomplete="off" />
+      <p class="help" id="admin-token-state"></p>
     </div>
+    <div class="dialog-actions">
+      <button class="btn" type="button" data-action="clear-token">Forget token</button>
+      <button class="btn btn-primary" type="submit">Save</button>
+    </div>
+  </form>
+  <dl class="kv kv-dialog">
+    <dt>Version</dt><dd id="about-version">–</dd>
+    <dt>Environment</dt><dd id="about-env">–</dd>
+  </dl>
+</dialog>
+
+<!-- Confirmation -->
+<dialog class="dialog dialog-sm" id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Are you sure?</h2>
+  <p class="dialog-text" id="confirm-text"></p>
+  <div class="dialog-actions">
+    <button class="btn" type="button" id="confirm-cancel">Cancel</button>
+    <button class="btn btn-danger" type="button" id="confirm-ok">Confirm</button>
   </div>
+</dialog>
 
-  <!-- ══════════════════════════════════════════
-       TAB 2: DOCUMENTS
-  ══════════════════════════════════════════ -->
-  <div class="tab-panel" id="panel-docs">
-    <div class="voice-grid">
-
-      <!-- PDF Upload -->
-      <div class="card">
-        <div class="card-title">📄 Upload PDF</div>
-        <div class="drop-zone" id="drop-zone"
-          onclick="document.getElementById('pdf-file-input').click()"
-          ondragover="handleDragOver(event)"
-          ondragleave="handleDragLeave(event)"
-          ondrop="handleDrop(event)">
-          <div class="drop-icon">📑</div>
-          <div class="drop-text">Drop PDF here or click to browse</div>
-          <div class="drop-sub">Supported: PDF · Max 50MB</div>
-        </div>
-        <input type="file" id="pdf-file-input" accept=".pdf" onchange="uploadPDF(this.files[0])">
-        <div class="status-bar mt-12" id="pdf-status" style="display:none;">
-          <div class="spinner" id="pdf-spinner"></div>
-          <span id="pdf-status-text">Uploading…</span>
-        </div>
-      </div>
-
-      <!-- URL + Text -->
-      <div class="card">
-        <div class="card-title">🌐 Ingest URL or Text</div>
-
-        <div class="form-group">
-          <label for="url-input">Website URL</label>
-          <div class="form-row">
-            <input type="url" id="url-input" placeholder="https://example.com/about" />
-            <button class="btn btn-primary btn-sm" onclick="ingestURL()">Ingest</button>
-          </div>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="form-group">
-          <label for="text-area-input">Paste Text</label>
-          <textarea id="text-area-input" rows="5" placeholder="Paste any text content here — FAQ, product info, documentation…"></textarea>
-        </div>
-        <div class="form-group">
-          <label for="text-name-input">Source Name (optional)</label>
-          <input type="text" id="text-name-input" placeholder="e.g. Company FAQ" />
-        </div>
-        <button class="btn btn-primary" style="width:100%;" onclick="ingestText()">✅ Add to Knowledge Base</button>
-
-        <div class="status-bar mt-12" id="text-status" style="display:none;">
-          <div class="spinner" id="text-spinner"></div>
-          <span id="text-status-text">Processing…</span>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- Recent ingestions -->
-    <div class="card mt-20">
-      <div class="card-title">📂 Ingestion History</div>
-      <div id="ingest-history" class="text-muted">No documents ingested yet.</div>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════
-       TAB 3: BOOKING
-  ══════════════════════════════════════════ -->
-  <div class="tab-panel" id="panel-booking">
-
-    <!-- Booking Stats Strip -->
-    <div class="card" style="margin-bottom:20px;">
-      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-        <div class="card-title" style="margin-bottom:0;">📊 Booking Overview</div>
-        <button class="btn btn-secondary btn-sm" onclick="loadBookingStats()">⟳ Refresh</button>
-      </div>
-      <div id="booking-stats" class="text-muted" style="margin-top:8px;">Loading…</div>
-    </div>
-
-    <div class="voice-grid">
-
-      <!-- Left: Check Availability -->
-      <div class="card">
-        <div class="card-title">📅 Check Availability</div>
-        <div class="form-group">
-          <label for="booking-date">Select Date</label>
-          <input type="date" id="booking-date" onchange="checkSlots()" />
-        </div>
-        <button class="btn btn-primary" style="width:100%; margin-top:8px;" onclick="checkSlots()">
-          🔍 Check Available Slots
-        </button>
-        <div class="status-bar mt-12" id="slots-status" style="display:none;">
-          <div class="spinner"></div>
-          <span>Checking availability…</span>
-        </div>
-        <div id="slots-result" style="margin-top:16px;"></div>
-      </div>
-
-      <!-- Right: Book Appointment -->
-      <div class="card">
-        <div class="card-title">✅ Book Appointment</div>
-        <div class="form-group">
-          <label for="book-name">Your Name</label>
-          <input type="text" id="book-name" placeholder="e.g. Rahul Sharma" />
-        </div>
-        <div class="form-group">
-          <label for="book-email">Your Email</label>
-          <input type="email" id="book-email" placeholder="e.g. rahul@example.com" />
-        </div>
-        <div class="form-group">
-          <label for="book-date">Date</label>
-          <input type="date" id="book-date" onchange="autoLoadSlots()" />
-        </div>
-        <div class="form-group">
-          <label for="book-time">Time (IST)</label>
-          <select id="book-time">
-            <option value="09:00">9:00 AM</option>
-            <option value="10:00">10:00 AM</option>
-            <option value="11:00">11:00 AM</option>
-            <option value="12:00">12:00 PM</option>
-            <option value="13:00">1:00 PM</option>
-            <option value="14:00">2:00 PM</option>
-            <option value="15:00">3:00 PM</option>
-            <option value="16:00">4:00 PM</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" style="width:100%;" onclick="bookAppointment()">
-          📅 Confirm Booking
-        </button>
-        <div class="status-bar mt-12" id="book-status" style="display:none;">
-          <div class="spinner"></div>
-          <span id="book-status-text">Booking…</span>
-        </div>
-        <div id="book-result" style="margin-top:16px;"></div>
-      </div>
-
-    </div>
-
-    <!-- Natural Language Booking -->
-    <div class="card mt-20">
-      <div class="card-title">🎤 Voice / Natural Language Booking</div>
-      <p class="text-muted" style="margin-bottom:12px; font-size:0.85rem;">
-        Type a one-shot booking request in natural language — e.g. "Book me an appointment tomorrow at 2 PM"
-      </p>
-      <div class="form-group">
-        <label for="nl-name">Your Name</label>
-        <input type="text" id="nl-name" placeholder="Your name" />
-      </div>
-      <div class="form-group">
-        <label for="nl-email">Your Email</label>
-        <input type="email" id="nl-email" placeholder="Your email" />
-      </div>
-      <div class="input-row mt-8">
-        <textarea class="text-input" id="nl-booking-input" rows="2"
-          placeholder="e.g. Book me an appointment tomorrow at 2 PM"></textarea>
-        <button class="btn btn-primary" onclick="naturalBooking()">Book</button>
-      </div>
-      <div class="status-bar mt-12" id="nl-status" style="display:none;">
-        <div class="spinner"></div>
-        <span>Processing your request…</span>
-      </div>
-      <div id="nl-result" style="margin-top:16px;"></div>
-    </div>
-
-    <!-- Booking History -->
-    <div class="card mt-20">
-      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
-        <div class="card-title" style="margin-bottom:0;">📋 Booking History</div>
-        <button class="btn btn-secondary btn-sm" onclick="loadBookingHistory()">⟳ Refresh</button>
-      </div>
-      <div id="booking-history-list">
-        <span class="text-muted">Loading booking history…</span>
-      </div>
-    </div>
-
-  </div><!-- end panel-booking -->
-
-  <!-- ══════════════════════════════════════════
-       TAB 4: BENCHMARK
-  ══════════════════════════════════════════ -->
-  <div class="tab-panel" id="panel-bench">
-
-    <div class="card" style="margin-bottom:20px;">
-      <div class="card-title">🚀 Run Benchmark</div>
-      <div style="display:flex; align-items:flex-end; gap:14px; flex-wrap:wrap;">
-        <div style="flex:1; min-width:120px;">
-          <label for="bench-n">Number of queries (1–20)</label>
-          <input type="number" id="bench-n" value="5" min="1" max="20" style="max-width:100px;" />
-        </div>
-        <button class="btn btn-primary" id="bench-btn" onclick="runBenchmark()">▶ Run Benchmark</button>
-        <button class="btn btn-secondary btn-sm" id="bench-report-btn" onclick="downloadReport()" style="display:none;">⬇ Download JSON Report</button>
-      </div>
-      <div class="status-bar mt-12" id="bench-status" style="display:none;">
-        <div class="spinner"></div>
-        <span id="bench-status-text">Running benchmark…</span>
-      </div>
-    </div>
-
-    <!-- KPI Cards -->
-    <div class="bench-grid" id="bench-kpis" style="display:none;">
-      <div class="kpi-card">
-        <div class="kpi-lbl">Latency P50</div>
-        <div class="kpi-val" id="bkpi-p50">—</div>
-        <div class="kpi-sub">Budget: 3000ms</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-lbl">Latency P95</div>
-        <div class="kpi-val" id="bkpi-p95">—</div>
-        <div class="kpi-sub">95th percentile</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-lbl">Within Budget</div>
-        <div class="kpi-val" id="bkpi-budget">—</div>
-        <div class="kpi-sub">≤3000ms queries</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-lbl">Cost / Query</div>
-        <div class="kpi-val green" id="bkpi-cost">—</div>
-        <div class="kpi-sub" id="bkpi-cost100"></div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-lbl">LLM Cost</div>
-        <div class="kpi-val green">FREE</div>
-        <div class="kpi-sub">Sarvam-M (₹0/token)</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-lbl">Queries</div>
-        <div class="kpi-val purple" id="bkpi-queries">—</div>
-        <div class="kpi-sub" id="bkpi-errors"></div>
-      </div>
-    </div>
-
-    <!-- Component bars -->
-    <div class="card" id="bench-comp-card" style="display:none; margin-bottom:20px;">
-      <div class="card-title">⏱ Component Latency Breakdown (Mean)</div>
-      <div class="bench-comp">
-        <div class="comp-row">
-          <div class="comp-lbl">STT</div>
-          <div class="comp-track"><div class="comp-fill fill-stt" id="bc-stt" style="width:0%"></div></div>
-          <div class="comp-ms" id="bcv-stt">—</div>
-        </div>
-        <div class="comp-row">
-          <div class="comp-lbl">RAG</div>
-          <div class="comp-track"><div class="comp-fill fill-rag" id="bc-rag" style="width:0%"></div></div>
-          <div class="comp-ms" id="bcv-rag">—</div>
-        </div>
-        <div class="comp-row">
-          <div class="comp-lbl">LLM</div>
-          <div class="comp-track"><div class="comp-fill fill-llm" id="bc-llm" style="width:0%"></div></div>
-          <div class="comp-ms" id="bcv-llm">—</div>
-        </div>
-        <div class="comp-row">
-          <div class="comp-lbl">TTS</div>
-          <div class="comp-track"><div class="comp-fill fill-tts" id="bc-tts" style="width:0%"></div></div>
-          <div class="comp-ms" id="bcv-tts">—</div>
-        </div>
-      </div>
-
-      <div class="tradeoff-section mt-16">
-        <h3>📈 Trade-off Analysis</h3>
-        <p><strong>Latency vs Accuracy:</strong> The RAG retrieval step adds ~20–80ms but ensures answers are grounded in your documents — preventing hallucinations. Without RAG, the LLM answers from training data only.</p>
-        <p><strong>Cost vs Performance:</strong> Sarvam-M is currently free, making this system extremely affordable. Primary costs are STT (₹30/hr audio) and TTS (₹30/10K chars). Local embeddings eliminate all embedding API costs.</p>
-        <p><strong>Open-Source Alternative:</strong> Replace Sarvam-M with Whisper (STT) + Llama 3 (LLM) + MeloTTS (TTS) for near-zero cost, at the expense of ~2–5× higher latency and more infrastructure work.</p>
-      </div>
-    </div>
-
-    <!-- Results table -->
-    <div class="card" id="bench-table-card" style="display:none;">
-      <div class="card-title">📋 Query Results</div>
-      <div style="overflow-x:auto;">
-        <table id="bench-table" style="width:100%; border-collapse:collapse; font-size:0.83rem;">
-          <thead>
-            <tr style="background:rgba(255,255,255,0.04);">
-              <th style="padding:10px 12px; text-align:left; color:var(--text-muted);">Query</th>
-              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">RAG (ms)</th>
-              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">LLM (ms)</th>
-              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">Total (ms)</th>
-              <th style="padding:10px 12px; text-align:right; color:var(--text-muted);">Cost (₹)</th>
-            </tr>
-          </thead>
-          <tbody id="bench-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-
-  </div><!-- end panel-bench -->
-
-</div><!-- end app-container -->
-
-<!-- Toast container -->
-<div class="toast-container" id="toast-container"></div>
+<div class="toasts" id="toast-container" role="status" aria-live="polite"></div>
 
 <script src="/static/app.js"></script>
 </body>

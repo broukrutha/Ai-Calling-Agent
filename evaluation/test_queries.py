@@ -3,10 +3,10 @@ test_queries.py – Sample test query suite with expected answer keywords.
 Used by the benchmark and accuracy evaluator.
 """
 
-from typing import List, Dict, Any
+from typing import Any
 
 # Structure: {query, expected_keywords, category}
-TEST_QUERIES: List[Dict[str, Any]] = [
+TEST_QUERIES: list[dict[str, Any]] = [
     # General
     {
         "query": "What is this service about?",
@@ -115,9 +115,9 @@ TEST_QUERIES: List[Dict[str, Any]] = [
 ]
 
 
-def get_queries_by_category(category: str) -> List[Dict[str, Any]]:
+def get_queries_by_category(category: str) -> list[dict[str, Any]]:
     return [q for q in TEST_QUERIES if q["category"] == category]
 
 
-def get_all_query_texts() -> List[str]:
+def get_all_query_texts() -> list[str]:
     return [q["query"] for q in TEST_QUERIES]

@@ -1,22 +1,13 @@
 """
-benchmark.py – CLI benchmarking tool for the Sarvam AI Voice Agent.
-Measures P50/P95 latency, accuracy, and cost across multiple queries.
+Benchmark the text pipeline (retrieval + LLM): latency, cost and answer accuracy.
 
-FIXES APPLIED:
-  - #2  Added `component_means` nested key to the summary latency dict so that
-        report_generator.py and the frontend benchmark tab can render the
-        STT/RAG/LLM/TTS bars correctly (they were always showing 0 before).
-  - #11 Removed unused `from voice_agent.rag_pipeline import RAGPipeline` import.
-  - #17 Use itertools.islice + itertools.cycle instead of the cryptic repeat/slice pattern.
+    python -m voice_agent.benchmark --queries 20 --report results.json --html report.html
 
-LATENCY OPTIMIZATIONS:
-  - Queries run with cache warmup: first query is not counted in statistics
-    if WARM_CACHE=True — gives more realistic steady-state measurements.
-  - Added p99 metric alongside P50/P95.
-
-Usage:
-    python -m voice_agent.benchmark --queries 20 --report results.json
+Speech-to-text and text-to-speech are not exercised here; use the web client's
+latency panel for end-to-end voice timings.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -25,165 +16,147 @@ import json
 import logging
 import statistics
 import time
-from typing import List
+from typing import Any
 
-from voice_agent.voice_agent import VoiceAgent
-from voice_agent.config import LATENCY_TARGET_TOTAL_MS
+from evaluation.metrics import keyword_accuracy, percentile
+from voice_agent import config
+from voice_agent.pipeline import VoiceAgent
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.WARNING)
 
 
-SAMPLE_QUERIES = [
-    "What is this service about?",
-    "How can I contact support?",
-    "What are the main features?",
-    "What languages are supported?",
-    "How do I get started?",
-    "What is the pricing model?",
-    "Is there a free trial available?",
-    "What are the system requirements?",
-    "How is my data protected?",
-    "Can I integrate this with other tools?",
-]
+async def run_benchmark(cases: list[dict[str, Any]], agent: VoiceAgent, verbose: bool = True) -> dict[str, Any]:
+    """
+    Run each case (``{"query": ..., "expected_keywords": [...]}``) through the
+    agent and summarise the results.
+    """
+    results: list[dict[str, Any]] = []
+    errors = 0
 
-
-async def run_benchmark(queries: List[str], agent: VoiceAgent) -> dict:
-    """Run text queries through the RAG pipeline and collect metrics."""
-    results      = []
-    total_cost   = 0.0
-    errors       = 0
-
-    print(f"\n{'='*60}")
-    print(f"  Sarvam AI Voice Agent — Benchmark ({len(queries)} queries)")
-    print(f"{'='*60}\n")
-
-    for i, query in enumerate(queries, 1):
+    for number, case in enumerate(cases, start=1):
+        query = case["query"]
+        started = time.perf_counter()
         try:
-            t0      = time.perf_counter()
-            result  = await agent.query_text(query)
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-
-            lat    = result["latency"]
-            cost   = result["cost_inr"]
-            total_cost += cost
-            within = elapsed_ms <= LATENCY_TARGET_TOTAL_MS
-
-            results.append({
-                "query":         query,
-                "answer_length": len(result["answer"]),
-                "retrieval_ms":  lat["retrieval_ms"],
-                "llm_ms":        lat["llm_ms"],
-                "total_ms":      round(elapsed_ms, 2),
-                "context_chunks": result["context_chunks"],
-                "cost_inr":      cost,
-                "within_budget": within,
-                "tokens_in":     result["tokens"]["input"],
-                "tokens_out":    result["tokens"]["output"],
-                "cached":        result.get("cached", False),
-            })
-
-            status = "✅" if within else "⚠️ "
-            cached_flag = " [CACHE]" if result.get("cached") else ""
-            print(
-                f"  {status} Q{i:02d} | {elapsed_ms:6.0f}ms "
-                f"(RAG:{lat['retrieval_ms']:.0f}ms LLM:{lat['llm_ms']:.0f}ms) "
-                f"| ₹{cost:.5f} | '{query[:45]}'{cached_flag}"
-            )
-
-        except Exception as e:
+            answer = await agent.query_text(query)
+        except Exception as exc:
             errors += 1
-            logger.error(f"Query {i} failed: {e}")
-            print(f"  ❌ Q{i:02d} | ERROR: {e}")
+            logger.error("Benchmark query %d failed: %s", number, exc)
+            if verbose:
+                print(f"  FAIL Q{number:02d} | {query[:50]}")
+            continue
 
-    if not results:
-        print("\n  No successful results.\n")
-        return {}
+        elapsed = (time.perf_counter() - started) * 1000
+        row = {
+            "query": query,
+            "answer_length": len(answer["answer"]),
+            "retrieval_ms": answer["latency"]["retrieval_ms"],
+            "llm_ms": answer["latency"]["llm_ms"],
+            "total_ms": round(elapsed, 2),
+            "context_chunks": answer["context_chunks"],
+            "cost_inr": answer["cost_inr"],
+            "within_budget": elapsed <= config.LATENCY_TARGET_TOTAL_MS,
+            "tokens_in": answer["tokens"]["input"],
+            "tokens_out": answer["tokens"]["output"],
+            "cached": answer.get("cached", False),
+            "accuracy": keyword_accuracy(answer["answer"], case.get("expected_keywords", [])),
+        }
+        results.append(row)
+        if verbose:
+            flag = "ok  " if row["within_budget"] else "SLOW"
+            print(f"  {flag} Q{number:02d} | {elapsed:6.0f} ms | acc {row['accuracy']:.0%} | {query[:50]}")
 
-    latencies           = [r["total_ms"] for r in results]
-    retrieval_latencies = [r["retrieval_ms"] for r in results]
-    llm_latencies       = [r["llm_ms"] for r in results]
-    within_budget_count = sum(1 for r in results if r["within_budget"])
-
-    latencies_sorted = sorted(latencies)
-    n = len(latencies_sorted)
-    p50 = statistics.median(latencies)
-    p95 = latencies_sorted[int(n * 0.95)] if latencies_sorted else 0
-    p99 = latencies_sorted[int(n * 0.99)] if n > 1 else latencies_sorted[-1]
-
-    summary = {
-        "total_queries": len(queries),
-        "successful":    len(results),
-        "errors":        errors,
-        "latency": {
-            "p50_ms":              round(p50, 2),
-            "p95_ms":              round(p95, 2),
-            "p99_ms":              round(p99, 2),
-            "min_ms":              round(min(latencies), 2),
-            "max_ms":              round(max(latencies), 2),
-            "mean_ms":             round(statistics.mean(latencies), 2),
-            "retrieval_mean_ms":   round(statistics.mean(retrieval_latencies), 2),
-            "llm_mean_ms":         round(statistics.mean(llm_latencies), 2),
-            "component_means": {
-                "stt_ms":        0,
-                "retrieval_ms":  round(statistics.mean(retrieval_latencies), 2),
-                "llm_ms":        round(statistics.mean(llm_latencies), 2),
-                "tts_ms":        0,
-            },
-        },
-        "budget_ms":          LATENCY_TARGET_TOTAL_MS,
-        "within_budget_pct":  round(within_budget_count / len(results) * 100, 1),
-        "cost": {
-            "total_inr":            round(total_cost, 4),
-            "per_query_avg_inr":    round(total_cost / len(results), 5),
-            "per_100_queries_inr":  round(total_cost / len(results) * 100, 3),
-        },
+    summary: dict[str, Any] = {
+        "total_queries": len(cases),
+        "successful": len(results),
+        "errors": errors,
+        "budget_ms": config.LATENCY_TARGET_TOTAL_MS,
         "api_stack": {
-            "stt":          "Saaras v3 (Sarvam AI)",
-            "llm":          "llama-3.1-8b-instant (Groq FREE)",
-            "tts":          "Bulbul v3 (Sarvam AI)",
-            "vector_store": "ChromaDB + paraphrase-MiniLM-L3-v2",
+            "llm": f"{agent.client.llm_provider}/{agent.client.llm_model}",
+            "stt": config.STT_MODEL,
+            "tts": config.TTS_MODEL,
+            "embeddings": config.EMBEDDING_MODEL,
         },
         "individual_results": results,
     }
+    if not results:
+        summary.update(latency={}, cost={}, accuracy={"mean_score": 0.0}, within_budget_pct=0.0)
+        return summary
 
-    print(f"\n{'─'*60}")
-    print(f"  📊 BENCHMARK SUMMARY")
-    print(f"{'─'*60}")
-    print(f"  Queries        : {len(results)}/{len(queries)} successful")
-    print(f"  Latency P50    : {summary['latency']['p50_ms']:.0f} ms")
-    print(f"  Latency P95    : {summary['latency']['p95_ms']:.0f} ms")
-    print(f"  Latency P99    : {summary['latency']['p99_ms']:.0f} ms")
-    print(f"  Within Budget  : {summary['within_budget_pct']}% (≤{LATENCY_TARGET_TOTAL_MS}ms)")
-    print(f"  Cost / query   : ₹{summary['cost']['per_query_avg_inr']:.5f}")
-    print(f"  Cost / 100q    : ₹{summary['cost']['per_100_queries_inr']:.3f}")
-    print(f"  LLM cost       : FREE (Groq llama-3.1-8b-instant)")
-    print(f"{'─'*60}\n")
+    totals = [row["total_ms"] for row in results]
+    retrieval_mean = statistics.mean(row["retrieval_ms"] for row in results)
+    llm_mean = statistics.mean(row["llm_ms"] for row in results)
+    total_cost = sum(row["cost_inr"] for row in results)
+    scores = [row["accuracy"] for row in results]
 
+    summary.update(
+        latency={
+            "p50_ms": round(statistics.median(totals), 2),
+            "p95_ms": round(percentile(totals, 0.95), 2),
+            "p99_ms": round(percentile(totals, 0.99), 2),
+            "min_ms": round(min(totals), 2),
+            "max_ms": round(max(totals), 2),
+            "mean_ms": round(statistics.mean(totals), 2),
+            "retrieval_mean_ms": round(retrieval_mean, 2),
+            "llm_mean_ms": round(llm_mean, 2),
+        },
+        within_budget_pct=round(sum(row["within_budget"] for row in results) / len(results) * 100, 1),
+        cost={
+            "total_inr": round(total_cost, 5),
+            "per_query_avg_inr": round(total_cost / len(results), 6),
+            "per_100_queries_inr": round(total_cost / len(results) * 100, 4),
+        },
+        accuracy={
+            "mean_score": round(statistics.mean(scores), 3),
+            "min_score": min(scores),
+            "max_score": max(scores),
+        },
+    )
+    if verbose:
+        latency = summary["latency"]
+        print(
+            f"\n  {len(results)}/{len(cases)} ok | P50 {latency['p50_ms']:.0f} ms | "
+            f"P95 {latency['p95_ms']:.0f} ms | within budget {summary['within_budget_pct']}% | "
+            f"accuracy {summary['accuracy']['mean_score']:.0%} | "
+            f"INR {summary['cost']['per_query_avg_inr']:.5f}/query\n"
+        )
     return summary
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Sarvam AI Voice Agent Benchmark")
-    parser.add_argument("--queries", type=int, default=10, help="Number of queries to run")
-    parser.add_argument("--report", type=str, default="", help="Save results to JSON file")
-    parser.add_argument("--custom-query", type=str, default="", help="Run a single custom query")
+def main() -> None:
+    from evaluation.report_generator import generate_html_report
+    from evaluation.test_queries import TEST_QUERIES
+    from voice_agent.logging_config import configure_logging
+
+    parser = argparse.ArgumentParser(description="Benchmark the AI Calling Agent text pipeline.")
+    parser.add_argument("--queries", type=int, default=10, help="number of queries to run")
+    parser.add_argument("--custom-query", default="", help="run one query of your own instead")
+    parser.add_argument("--report", default="", help="write the JSON summary to this file")
+    parser.add_argument("--html", default="", help="write an HTML report to this file")
     args = parser.parse_args()
 
-    agent = VoiceAgent()
+    configure_logging()
+    logging.getLogger().setLevel(logging.WARNING)
 
     if args.custom_query:
-        queries = [args.custom_query]
+        cases = [{"query": args.custom_query, "expected_keywords": []}]
     else:
-        queries = list(itertools.islice(itertools.cycle(SAMPLE_QUERIES), args.queries))
+        cases = list(itertools.islice(itertools.cycle(TEST_QUERIES), max(args.queries, 1)))
 
-    summary = await run_benchmark(queries, agent)
+    async def run() -> dict[str, Any]:
+        agent = VoiceAgent()
+        try:
+            return await run_benchmark(cases, agent)
+        finally:
+            await agent.close()
 
-    if args.report and summary:
-        with open(args.report, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"  📄 Report saved to: {args.report}\n")
+    summary = asyncio.run(run())
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False)
+        print(f"  JSON summary: {args.report}")
+    if args.html:
+        print(f"  HTML report:  {generate_html_report(summary, args.html)}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

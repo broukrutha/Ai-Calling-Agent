@@ -1,224 +1,197 @@
 """
-vector_store.py – ChromaDB-backed vector store with local embeddings.
-Uses sentence-transformers/paraphrase-MiniLM-L3-v2 (free, fast, ~80 MB).
+Knowledge-base storage: ChromaDB with local sentence-transformer embeddings.
 
-LATENCY OPTIMIZATIONS:
-  - _ef (embedding function) is shared as a module-level singleton so the
-    model is loaded ONCE even if VectorStore is instantiated multiple times.
-  - retrieve() skips _collection.count() guard — ChromaDB handles empty
-    collections gracefully (returns empty lists). No extra round-trip.
-  - n_results capped at min(k, existing_count) only if we know count cheaply;
-    otherwise ChromaDB handles it internally.
-  - include list trimmed: only request what we need (no "embeddings").
-
-FIX:
-  - _get_ef() now CLEARS dead local proxy env vars instead of raising.
-    Previously a Windows system proxy (127.0.0.1:9) would crash the entire
-    VectorStore init with a RuntimeError, putting the KB in degraded mode.
-    Now it silently removes the bad proxy and proceeds with the download,
-    matching the same pattern already used in config.py.
+* Chunk ids are derived from the content, so ingesting the same document
+  twice updates it instead of duplicating every chunk.
+* ``version`` increases on every change; the answer cache uses it to drop
+  answers that were generated from an older knowledge base.
+* If the embedding model cannot be loaded the store reports itself as
+  unavailable and the rest of the application keeps running.
 """
 
-import logging
-import os
-from typing import List, Optional, Tuple
-from urllib.parse import urlparse
+from __future__ import annotations
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+import hashlib
+import logging
+import threading
+from collections import Counter
+from typing import Any
+
 from langchain_core.documents import Document
 
-from voice_agent.config import (
-    CHROMA_PERSIST_DIR,
-    CHROMA_COLLECTION_NAME,
-    EMBEDDING_MODEL,
-    TOP_K_RETRIEVAL,
-    MIN_RELEVANCE_SCORE,
-)
+from voice_agent import config
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level singleton embedding function ─────────────────────────────────
-# Loading the SentenceTransformer model takes ~1–3 s on first call.
-# By holding the EF at module scope, all VectorStore instances share one model.
-_SHARED_EF: SentenceTransformerEmbeddingFunction | None = None
-
-# All proxy env var names to check (covers uppercase + lowercase variants)
-_PROXY_ENV_NAMES = (
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-    "http_proxy", "https_proxy", "all_proxy",
-)
+_BATCH_SIZE = 500
+_shared_embedder: Any = None
+_embedder_lock = threading.Lock()
 
 
-def _get_ef() -> SentenceTransformerEmbeddingFunction:
-    global _SHARED_EF
-    if _SHARED_EF is None:
-        # ── Clear dead local proxy before model download ───────────────────
-        # Windows sometimes inherits a system proxy like http://127.0.0.1:9
-        # that is unreachable. This blocks HuggingFace model downloads and
-        # every outbound API call. We clear it here (same as config.py does)
-        # instead of raising — the model will then download directly.
-        for env_name in _PROXY_ENV_NAMES:
-            raw_proxy = os.getenv(env_name, "").strip()
-            if not raw_proxy:
-                continue
-            parsed = urlparse(raw_proxy)
-            if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 9:
-                os.environ.pop(env_name, None)
-                logger.warning(
-                    f"Cleared dead local proxy from {env_name} ({raw_proxy}). "
-                    "Embedding model will be downloaded directly."
-                )
+def _default_embedder() -> Any:
+    """Load the embedding model once per process (it takes 1–3 seconds)."""
+    global _shared_embedder
+    with _embedder_lock:
+        if _shared_embedder is None:
+            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-        _SHARED_EF = SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL, device="cpu"
-        )
-        logger.info(f"Embedding model loaded: {EMBEDDING_MODEL}")
-    return _SHARED_EF
+            _shared_embedder = SentenceTransformerEmbeddingFunction(
+                model_name=config.EMBEDDING_MODEL, device="cpu"
+            )
+            logger.info("Embedding model loaded: %s", config.EMBEDDING_MODEL)
+        return _shared_embedder
+
+
+def _chunk_id(source: str, text: str) -> str:
+    return hashlib.sha256(f"{source}\x00{text}".encode()).hexdigest()[:32]
+
+
+def _clean_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Chroma accepts only scalar metadata values and rejects empty dicts."""
+    cleaned = {
+        key: value if isinstance(value, (str, int, float, bool)) else str(value)
+        for key, value in (metadata or {}).items()
+        if value is not None
+    }
+    cleaned.setdefault("source", "unknown")
+    return cleaned
 
 
 class VectorStore:
-    """
-    Wraps ChromaDB with a SentenceTransformer embedding function.
-    Provides add / retrieve / clear operations.
-    """
+    """Add, search and manage knowledge-base chunks."""
 
-    def __init__(self) -> None:
-        self._ef: Optional[SentenceTransformerEmbeddingFunction] = None
-        self._client = None
-        self._collection = None
+    def __init__(
+        self,
+        persist_dir: str | None = None,
+        collection_name: str | None = None,
+        embedding_function: Any = None,
+    ) -> None:
+        self._persist_dir = persist_dir or config.CHROMA_PERSIST_DIR
+        self._name = collection_name or config.CHROMA_COLLECTION_NAME
+        self._embedder = embedding_function
+        self._client: Any = None
+        self._collection: Any = None
         self._available = False
-        self._init_error: Optional[str] = None
+        self._init_error: str | None = None
+        self._lock = threading.Lock()
+        self.version = 0
 
         try:
-            self._ef = _get_ef()   # shared singleton — no reload cost
-            self._client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-            self._collection = self._client.get_or_create_collection(
-                name=CHROMA_COLLECTION_NAME,
-                embedding_function=self._ef,
-                metadata={"hnsw:space": "cosine"},
-            )
+            import chromadb
+
+            if self._embedder is None:
+                self._embedder = _default_embedder()
+            self._client = chromadb.PersistentClient(path=self._persist_dir)
+            self._collection = self._open_collection()
             self._available = True
-            logger.info(
-                f"VectorStore ready – collection '{CHROMA_COLLECTION_NAME}' "
-                f"({self._collection.count()} docs)."
-            )
+            logger.info("Knowledge base ready: '%s' (%d chunks)", self._name, self._collection.count())
         except Exception as exc:
-            self._init_error = str(exc)
-            logger.exception(
-                "VectorStore unavailable. Running in degraded mode without knowledge-base embeddings."
-            )
+            self._init_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("Knowledge base unavailable — continuing without document retrieval.")
+
+    def _open_collection(self) -> Any:
+        return self._client.get_or_create_collection(
+            name=self._name,
+            embedding_function=self._embedder,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def is_available(self) -> bool:
         return self._available
 
     def _require_available(self) -> None:
         if not self._available:
-            raise RuntimeError(
-                "Knowledge base is unavailable because the embedding model could not be loaded. "
-                f"Details: {self._init_error or 'unknown error'}"
-            )
+            raise RuntimeError("The knowledge base is unavailable: the embedding model could not be loaded.")
 
-    # ── Write ──────────────────────────────────────────────────────────────
+    # ── Write ────────────────────────────────────────────────────────────────
 
-    def add_documents(self, docs: List[Document]) -> int:
-        """Embed and store a list of LangChain Document objects. Returns count added."""
+    def add_documents(self, docs: list[Document]) -> int:
+        """Embed and store chunks. Returns how many distinct chunks were written."""
         self._require_available()
-        if not docs:
-            logger.warning("add_documents called with empty list – skipping.")
-            return 0
-
-        import uuid
-        ids, texts, metas = [], [], []
-
+        unique: dict[str, tuple[str, dict[str, Any]]] = {}
         for doc in docs:
-            uid = str(uuid.uuid4())
-            ids.append(uid)
-            texts.append(doc.page_content)
-            metas.append(doc.metadata or {})
-
-        self._collection.add(ids=ids, documents=texts, metadatas=metas)
-        logger.info(f"Added {len(docs)} chunks → total {self._collection.count()}.")
-        return len(docs)
-
-    # ── Read ───────────────────────────────────────────────────────────────
-
-    def retrieve(
-        self, query: str, k: int = TOP_K_RETRIEVAL
-    ) -> List[Tuple[Document, float]]:
-        """
-        Retrieve top-k most relevant chunks.
-
-        Skips _collection.count() guard — ChromaDB returns empty results
-        naturally when the collection is empty, so no extra round-trip needed.
-        Only requests documents/metadatas/distances (no embeddings) to reduce
-        data transfer from ChromaDB.
-        """
-        if not self._available or self._collection is None:
-            logger.warning("Vector store unavailable – returning no retrieval results.")
-            return []
-
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=max(k, 1),
-            include=["documents", "metadatas", "distances"],
-        )
-
-        hits: List[Tuple[Document, float]] = []
-
-        docs_list  = results.get("documents", [[]])[0]
-        metas_list = results.get("metadatas", [[]])[0]
-        dists_list = results.get("distances", [[]])[0]
-
-        if not docs_list:
-            logger.warning("Vector store is empty or no results returned.")
-            return []
-
-        for text, meta, dist in zip(docs_list, metas_list, dists_list):
-            score = round(1.0 - float(dist), 4)
-            if score >= MIN_RELEVANCE_SCORE:
-                hits.append((Document(page_content=text, metadata=meta), score))
-
-        logger.info(f"Retrieved {len(hits)} relevant chunks (query: '{query[:60]}…').")
-        return hits
-
-    def retrieve_context_string(self, query: str, k: int = TOP_K_RETRIEVAL) -> str:
-        """Return retrieved chunks as a single formatted string for the LLM prompt."""
-        hits = self.retrieve(query, k)
-        if not hits:
-            return "No relevant documents found in the knowledge base."
-        parts = []
-        for i, (doc, score) in enumerate(hits, 1):
-            src = doc.metadata.get("source", "unknown")
-            parts.append(
-                f"[Chunk {i} | Source: {src} | Relevance: {score:.2f}]\n{doc.page_content}"
-            )
-        return "\n\n---\n\n".join(parts)
-
-    # ── Admin ──────────────────────────────────────────────────────────────
-
-    def count(self) -> int:
-        if not self._available or self._collection is None:
+            text = (doc.page_content or "").strip()
+            if not text:
+                continue
+            metadata = _clean_metadata(doc.metadata)
+            unique[_chunk_id(str(metadata["source"]), text)] = (text, metadata)
+        if not unique:
             return 0
-        return self._collection.count()
+
+        ids = list(unique)
+        with self._lock:
+            for start in range(0, len(ids), _BATCH_SIZE):
+                batch = ids[start:start + _BATCH_SIZE]
+                self._collection.upsert(
+                    ids=batch,
+                    documents=[unique[i][0] for i in batch],
+                    metadatas=[unique[i][1] for i in batch],
+                )
+            self.version += 1
+        logger.info("Stored %d chunks (total %d).", len(ids), self._collection.count())
+        return len(ids)
+
+    def delete_source(self, source: str) -> int:
+        """Remove every chunk that came from ``source``. Returns the number removed."""
+        self._require_available()
+        with self._lock:
+            ids = self._collection.get(where={"source": source}, include=[])["ids"]
+            if ids:
+                self._collection.delete(ids=ids)
+                self.version += 1
+        logger.info("Removed %d chunks from source '%s'.", len(ids), source)
+        return len(ids)
 
     def clear(self) -> None:
         self._require_available()
-        self._client.delete_collection(CHROMA_COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(
-            name=CHROMA_COLLECTION_NAME,
-            embedding_function=self._ef,
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.info("Vector store cleared.")
+        with self._lock:
+            self._client.delete_collection(self._name)
+            self._collection = self._open_collection()
+            self.version += 1
+        logger.info("Knowledge base cleared.")
 
-    def collection_info(self) -> dict:
+    # ── Read ─────────────────────────────────────────────────────────────────
+
+    def retrieve(self, query: str, k: int | None = None) -> list[tuple[Document, float]]:
+        """The ``k`` most relevant chunks with a 0–1 relevance score, best first."""
+        if not self._available:
+            return []
+        results = self._collection.query(
+            query_texts=[query],
+            n_results=max(k or config.TOP_K_RETRIEVAL, 1),
+            include=["documents", "metadatas", "distances"],
+        )
+        documents = (results.get("documents") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+
+        hits = []
+        for text, metadata, distance in zip(documents, metadatas, distances, strict=False):
+            score = round(1.0 - float(distance), 4)
+            if score >= config.MIN_RELEVANCE_SCORE:
+                hits.append((Document(page_content=text, metadata=metadata or {}), score))
+        return hits
+
+    def count(self) -> int:
+        return self._collection.count() if self._available else 0
+
+    def sources(self) -> list[dict[str, Any]]:
+        """Every ingested source with its chunk count, largest first."""
+        if not self._available:
+            return []
+        metadatas = self._collection.get(include=["metadatas"])["metadatas"] or []
+        counts = Counter(str((metadata or {}).get("source", "unknown")) for metadata in metadatas)
+        return [{"source": source, "chunks": chunks} for source, chunks in counts.most_common()]
+
+    def collection_info(self) -> dict[str, Any]:
         return {
-            "collection":      CHROMA_COLLECTION_NAME,
-            "total_chunks":    self.count(),
-            "embedding_model": EMBEDDING_MODEL,
-            "persist_dir":     CHROMA_PERSIST_DIR,
-            "status":          "ready" if self._available else "degraded",
-            "available":       self._available,
-            "error":           self._init_error,
+            "collection": self._name,
+            "total_chunks": self.count(),
+            "embedding_model": config.EMBEDDING_MODEL,
+            "status": "ready" if self._available else "degraded",
+            "available": self._available,
         }
+
+    @property
+    def init_error(self) -> str | None:
+        return self._init_error
