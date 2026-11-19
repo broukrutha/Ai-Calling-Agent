@@ -25,6 +25,8 @@ class Services:
         self._vector_store = vector_store
         self._agent = agent
         self._lock = threading.Lock()
+        # Embedding function for evaluation indexes; None uses the configured model.
+        self.eval_embedding_function = None
 
     @property
     def vector_store(self) -> VectorStore:

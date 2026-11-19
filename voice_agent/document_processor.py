@@ -17,9 +17,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from voice_agent import config
+from voice_agent.chunking import chunk_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +31,6 @@ _USER_AGENT = "Mozilla/5.0 (compatible; VoiceAgentBot/1.0)"
 
 class IngestError(ValueError):
     """The source was rejected or could not be read. The message is user-safe."""
-
-
-def _splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(
-        chunk_size=config.CHUNK_SIZE,
-        chunk_overlap=config.CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", "। ", " ", ""],
-    )
 
 
 # ── URL safety ───────────────────────────────────────────────────────────────
@@ -106,18 +98,20 @@ def load_pdf(file_bytes: bytes, filename: str = "document.pdf") -> list[Document
             raise IngestError("Password-protected PDFs are not supported.")
         if pdf.page_count > _MAX_PDF_PAGES:
             raise IngestError(f"PDFs are limited to {_MAX_PDF_PAGES} pages.")
-        pages = [
-            Document(page_content=text, metadata={"source": filename, "page": number})
-            for number, page in enumerate(pdf, start=1)
-            if (text := page.get_text("text").strip())
-        ]
+        title = (pdf.metadata or {}).get("title", "").strip() or Path(filename).stem.replace("_", " ")
+        pages = [(number, text) for number, page in enumerate(pdf, start=1) if (text := page.get_text("text").strip())]
     finally:
         pdf.close()
 
     if not pages:
         raise IngestError("No text was found in the PDF. Scanned documents need OCR first.")
     logger.info("PDF '%s': %d pages with text.", filename, len(pages))
-    return _splitter().split_documents(pages)
+    chunks: list[Document] = []
+    for number, text in pages:
+        chunks.extend(chunk_text(text, source=filename, base_metadata={"page": number}, title=title))
+    for position, chunk in enumerate(chunks):
+        chunk.metadata["chunk"] = position
+    return chunks
 
 
 def load_url(url: str, timeout: int | None = None) -> list[Document]:
@@ -145,21 +139,46 @@ def load_url(url: str, timeout: int | None = None) -> list[Document]:
             raise IngestError("The download was interrupted.") from exc
         html = bytes(body).decode(resp.encoding or "utf-8", errors="replace")
 
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form"]):
-        tag.decompose()
-    text = " ".join(soup.get_text(separator="\n").split())
-    if not text:
+    text, title = html_to_text(html)
+    if not text.strip():
         raise IngestError("No readable text was found on that page.")
     logger.info("URL ingested: %d characters.", len(text))
-    return _splitter().split_documents([Document(page_content=text, metadata={"source": url})])
+    return chunk_text(text, source=url, title=title)
+
+
+def html_to_text(html: str) -> tuple[str, str]:
+    """
+    Readable text from HTML with its structure kept: headings become Markdown
+    headings and list items become bullets, so the chunker can follow them.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form", "aside", "svg"]):
+        tag.decompose()
+    title = " ".join((soup.title.get_text() if soup.title else "").split())
+    root = soup.find("main") or soup.find("article") or soup.body or soup
+    lines: list[str] = []
+    for element in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "td", "th", "pre", "blockquote", "dt", "dd"]):
+        if element.find_parent(["li", "td", "th", "p", "blockquote"]) is not None and element.name in {"p", "li"}:
+            continue  # nested inside another block that is already emitted
+        text = " ".join(element.get_text(" ").split())
+        if not text:
+            continue
+        if element.name.startswith("h"):
+            lines += ["", "#" * int(element.name[1]) + " " + text, ""]
+        elif element.name == "li":
+            lines.append(f"- {text}")
+        else:
+            lines += [text, ""]
+    if not any(line.strip() for line in lines):
+        lines = [" ".join(root.get_text(" ").split())]
+    return "\n".join(lines), title
 
 
 def load_text(text: str, source_name: str = "manual_input") -> list[Document]:
     text = (text or "").strip()
     if not text:
         raise IngestError("There is no text to ingest.")
-    return _splitter().split_documents([Document(page_content=text, metadata={"source": source_name})])
+    return chunk_text(text, source=source_name)
 
 
 def load_file(path: str) -> list[Document]:

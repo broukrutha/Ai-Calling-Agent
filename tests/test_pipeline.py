@@ -218,3 +218,55 @@ async def test_text_query_shape(agent, client):
     result = await agent.query_text("What are your office hours?")
     assert result["answer"] == client.answer and result["tokens"] == {"input": 100, "output": 20}
     assert set(result["latency"]) == {"retrieval_ms", "llm_ms", "total_ms"}
+
+
+# ── Traces, citations, speech-safe output ────────────────────────────────────
+
+async def test_every_voice_turn_is_traced_with_its_details(agent, client):
+    from voice_agent import tracing
+
+    events = await collect(agent, client, "What are your office hours?")
+    done = events[-1]
+    trace = tracing.get_trace(done["trace_id"])
+    assert (trace["kind"], trace["channel"], trace["provider"]) == ("answer", "voice", "fake")
+    assert trace["passage_count"] == 1 and trace["passages"][0]["source"] == "faq.txt"
+    assert trace["first_audio_ms"] > 0 and trace["question"] == "What are your office hours?"
+    assert done["citations"][0]["source"] == "faq.txt"
+
+    await collect(agent, client, "um")
+    await collect(agent, client, "Book an appointment tomorrow at 2 pm", ConversationSession())
+    kinds = [row["kind"] for row in tracing.list_traces()]
+    assert kinds == ["booking", "noise", "answer"]
+
+
+async def test_provider_failures_are_traced_then_raised(agent, client):
+    from voice_agent import tracing
+    from voice_agent.sarvam_client import ProviderError
+
+    async def broken(*args, **kwargs):
+        raise ProviderError("stt down")
+
+    client.transcribe = broken
+    with pytest.raises(ProviderError):
+        await collect(agent, client, "anything")
+    [trace] = tracing.list_traces()
+    assert trace["kind"] == "error" and "stt down" in trace["error"]
+
+
+async def test_markdown_is_never_spoken_or_shown(agent, client):
+    client.answer = "**Cleaning** costs ₹1,200 [1]. Book online at https://www.example.com/book today."
+    events = await collect(agent, client, "How much is cleaning?")
+    spoken = [text for text, _ in client.tts_calls]
+    assert all("*" not in text and "http" not in text and "[1]" not in text for text in spoken)
+    assert any("1,200 rupees" in text for text in spoken)
+    assert events[-1]["answer"].startswith("Cleaning costs ₹1,200.")
+
+
+async def test_typed_follow_up_searches_with_the_previous_turn(agent, client):
+    session = ConversationSession()
+    await agent.query_text("What are your office hours?", session=session)
+    result = await agent.query_text("And on Saturdays?", session=session)
+    from voice_agent import tracing
+
+    trace = tracing.get_trace(result["trace_id"])
+    assert trace["followup"] == 1 and "office hours" in trace["retrieval_query"]

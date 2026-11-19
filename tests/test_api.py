@@ -88,7 +88,14 @@ ADMIN_ROUTES = [
     ("get", "/kb/sources", {}),
     ("delete", "/kb/sources?source=faq.txt", {}),
     ("delete", "/kb/clear", {}),
-    ("get", "/benchmark?n=1", {}),
+    ("get", "/ops/summary", {}),
+    ("get", "/ops/timeseries", {}),
+    ("get", "/ops/traces", {}),
+    ("get", "/ops/export", {}),
+    ("post", "/evaluation/runs", {"json": {"suite": "dialog"}}),
+    ("get", "/evaluation/runs", {}),
+    ("get", "/evaluation/datasets", {}),
+    ("post", "/evaluation/generate", {"json": {"limit": 10}}),
     ("post", "/booking/create", {"json": {"date": "2026-04-06", "time": "10:00", "name": "A", "email": "a@example.com"}}),
     ("post", "/booking/cancel", {"json": {"booking_uid": "abc12345"}}),
     ("get", "/booking/list", {}),
@@ -221,13 +228,59 @@ def test_missing_speech_key_is_a_clear_503(tmp_path):
         assert test_client.get("/booking/slots", params={"date": "2026-04-06"}).status_code == 200
 
 
-def test_benchmark_reports_latency_cost_and_accuracy(client):
-    body = client.get("/benchmark", params={"n": 3}).json()
-    assert body["successful"] == 3 and body["errors"] == 0
-    assert body["api_stack"]["llm"] == "fake/fake-1"
-    assert {"p50_ms", "p95_ms", "p99_ms"} <= set(body["latency"])
-    assert 0 <= body["accuracy"]["mean_score"] <= 1
-    assert client.get("/benchmark", params={"n": 500}).status_code == 422
+def test_answers_carry_citations_and_a_trace_id_that_can_be_rated(client):
+    body = client.post("/query", json={"query": "What are your office hours?"}).json()
+    assert body["citations"][0]["source"] == "faq.txt" and "nine to five" in body["citations"][0]["snippet"]
+    trace_id = body["trace_id"]
+
+    assert client.post("/feedback", json={"trace_id": trace_id, "rating": -1, "comment": "too vague"}).status_code == 200
+    assert client.post("/feedback", json={"trace_id": "0" * 24, "rating": 1}).status_code == 404
+    assert client.post("/feedback", json={"trace_id": trace_id, "rating": 5}).status_code == 422
+    assert client.post("/feedback", json={"trace_id": "../etc", "rating": 1}).status_code == 422
+
+    trace = client.get(f"/ops/traces/{trace_id}").json()
+    assert (trace["kind"], trace["channel"], trace["rating"], trace["comment"]) == ("answer", "api", -1, "too vague")
+    assert trace["passages"][0]["source"] == "faq.txt" and trace["provider"] == "fake"
+
+    summary = client.get("/ops/summary", params={"window": "24h"}).json()
+    assert summary["turns"] == 1 and summary["feedback"]["not_helpful"] == 1
+    assert summary["latency_ms"]["total_ms"]["count"] == 1
+
+    export = client.get("/ops/export").text.strip().splitlines()
+    assert len(export) == 1 and '"answer_given"' in export[0]
+    assert client.get("/ops/timeseries", params={"window": "7d"}).json()["points"]
+    assert client.get("/ops/summary", params={"window": "1y"}).status_code == 422
+
+
+def test_evaluation_runs_in_the_background_and_is_stored(services, client):
+    import time
+
+    services.eval_embedding_function = HashingEmbedder()
+    datasets = client.get("/evaluation/datasets").json()
+    assert datasets["golden"]["cases"] >= 60 and datasets["generated"]["available"] is False
+
+    started = client.post("/evaluation/runs", json={"suite": "dialog"})
+    assert started.status_code == 202
+    run_id = started.json()["id"]
+    for _ in range(100):
+        run = client.get(f"/evaluation/runs/{run_id}").json()
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "completed", run.get("error")
+    [suite] = run["suites"]
+    assert suite["suite"] == "dialog" and suite["gates_passed"] and suite["headline"]["success_rate"] == 1.0
+    assert client.get("/evaluation/runs").json()["runs"][0]["id"] == run_id
+    assert store.get_bookings() == []                       # evaluation never touches real bookings
+
+    live = client.post("/evaluation/runs", json={"suite": "retrieval", "kb": "live"}).json()["id"]
+    for _ in range(100):
+        run = client.get(f"/evaluation/runs/{live}").json()
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "failed" and "Generate questions" in run["error"]
+    assert client.post("/evaluation/runs", json={"suite": "nonsense"}).status_code == 422
 
 
 # ── Booking ──────────────────────────────────────────────────────────────────

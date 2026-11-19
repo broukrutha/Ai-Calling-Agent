@@ -1,0 +1,17 @@
+{
+  "_comment": "Regression gates for the sample knowledge base and golden dataset. Dotted keys address nested summary fields.",
+  "retrieval": {
+    "answerable.context_hit": 0.94,
+    "answerable.hit_at_1": 0.9,
+    "answerable.mrr": 0.92
+  },
+  "dialog": {
+    "success_rate": 1.0
+  },
+  "answers": {
+    "answer_accuracy": 0.85,
+    "refusal_accuracy": 0.75,
+    "faithfulness": 0.9,
+    "voice_format_rate": 0.9
+  }
+}

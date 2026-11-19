@@ -1,0 +1,186 @@
+[
+ {
+  "id": "book-one-sentence",
+  "description": "Date and time in the first sentence",
+  "turns": [
+   "Book an appointment next monday at 2 pm",
+   "Rahul Sharma",
+   "rahul at gmail dot com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "day": "next monday",
+   "slot": "14:00",
+   "name": "Rahul Sharma",
+   "email": "rahul@gmail.com"
+  }
+ },
+ {
+  "id": "book-step-by-step",
+  "description": "Agent asks for each detail in turn",
+  "turns": [
+   "I'd like to book an appointment",
+   "next tuesday",
+   "11",
+   "My name is Priya Nair",
+   "my email is priya dot nair at outlook dot com",
+   "yes please"
+  ],
+  "expect": {
+   "booked": true,
+   "day": "next tuesday",
+   "slot": "11:00",
+   "name": "Priya Nair",
+   "email": "priya.nair@outlook.com"
+  }
+ },
+ {
+  "id": "book-slot-taken",
+  "description": "Requested time is taken; caller picks an offered alternative",
+  "setup": [
+   {
+    "day": "next monday",
+    "slot": "14:00"
+   }
+  ],
+  "turns": [
+   "book next monday at 2 pm",
+   "the first one",
+   "Asha",
+   "asha@example.com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "day": "next monday",
+   "slot": "15:00"
+  }
+ },
+ {
+  "id": "book-refused-at-confirmation",
+  "description": "A polite refusal must not book",
+  "turns": [
+   "book next monday at 10 am",
+   "Kiran",
+   "kiran@example.com",
+   "No, please don't"
+  ],
+  "expect": {
+   "booked": false,
+   "final_state": "idle"
+  }
+ },
+ {
+  "id": "book-email-corrected",
+  "description": "Caller corrects the email at the confirmation step",
+  "turns": [
+   "book next wednesday at 4 pm",
+   "Meera",
+   "meera@example.com",
+   "no, the email is wrong",
+   "meera dot k at example dot com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "slot": "16:00",
+   "email": "meera.k@example.com"
+  }
+ },
+ {
+  "id": "book-part-of-day",
+  "description": "Caller gives only a part of the day, then a time",
+  "turns": [
+   "can I get an appointment next thursday afternoon",
+   "2 pm",
+   "Arjun",
+   "arjun@example.com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "day": "next thursday",
+   "slot": "14:00"
+  }
+ },
+ {
+  "id": "book-outside-hours",
+  "description": "A time outside office hours is not silently moved",
+  "turns": [
+   "book next friday at 9 pm",
+   "11 am",
+   "Sana",
+   "sana@example.com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "day": "next friday",
+   "slot": "11:00"
+  }
+ },
+ {
+  "id": "book-weekend-redirect",
+  "description": "Saturday has no openings; caller accepts the next weekday",
+  "turns": [
+   "book an appointment next saturday at 10 am",
+   "yes",
+   "Vikram",
+   "vikram@example.com",
+   "yes"
+  ],
+  "expect": {
+   "booked": true,
+   "slot": "10:00"
+  }
+ },
+ {
+  "id": "cancel-by-reference",
+  "description": "Caller reads out the six-digit reference",
+  "setup": [
+   {
+    "day": "next monday",
+    "slot": "09:00"
+   }
+  ],
+  "turns": [
+   "I want to cancel my appointment",
+   "{ref}",
+   "yes"
+  ],
+  "expect": {
+   "cancelled": true
+  }
+ },
+ {
+  "id": "cancel-changed-mind",
+  "description": "Cancellation is not executed without a yes",
+  "setup": [
+   {
+    "day": "next monday",
+    "slot": "09:00"
+   }
+  ],
+  "turns": [
+   "cancel my booking {ref}",
+   "no, keep it"
+  ],
+  "expect": {
+   "cancelled": false,
+   "final_state": "idle"
+  }
+ },
+ {
+  "id": "abandon-mid-flow",
+  "description": "Caller changes their mind before giving details",
+  "turns": [
+   "book an appointment",
+   "never mind"
+  ],
+  "expect": {
+   "booked": false,
+   "final_state": "idle"
+  }
+ }
+]

@@ -22,6 +22,7 @@ ignore = [
     "E501",    # line length is handled by the formatter's judgement, not the linter
     "S101",    # asserts document invariants and are used throughout the tests
     "SIM108",  # ternaries are not always clearer
+    "SIM905",  # word lists read better as one string than as hundreds of literals
 ]
 
 [tool.ruff.lint.per-file-ignores]
