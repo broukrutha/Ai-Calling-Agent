@@ -163,6 +163,9 @@ def is_broad(question: str) -> bool:
 
 # ── Retriever ────────────────────────────────────────────────────────────────
 
+FOLLOWUP_CONTEXT_WEIGHT = 0.75  # stable from 0.6 to 0.8 on the golden set; 0.85+ lets the old topic win
+
+
 class HybridRetriever:
     """Dense + BM25 retrieval with rank fusion. Thread-safe; one per vector store."""
 
@@ -198,9 +201,12 @@ class HybridRetriever:
 
         dense_scores: dict[str, float] = {}
         texts: dict[str, Candidate] = {}
-        for hits in self.vs.dense_search(queries, depth):
+        # A follow-up also searches with the previous turn folded in. Matches found
+        # only that way are discounted, so the new topic ranks ahead of the old one.
+        weights = [1.0] + [FOLLOWUP_CONTEXT_WEIGHT] * (len(queries) - 1)
+        for weight, hits in zip(weights, self.vs.dense_search(queries, depth), strict=True):
             for hit in hits:
-                dense_scores[hit.id] = max(dense_scores.get(hit.id, 0.0), hit.score)
+                dense_scores[hit.id] = max(dense_scores.get(hit.id, 0.0), hit.score * weight)
                 texts[hit.id] = hit
 
         coverage: dict[str, float] = {}
@@ -214,9 +220,9 @@ class HybridRetriever:
                     texts[hit.id] = self._chunks[hit.id]
             # Strong keyword matches the embedding search missed get a real dense score.
             missing = [chunk_id for chunk_id in coverage if chunk_id not in dense_scores and chunk_id in texts]
-            for query in queries:
+            for weight, query in zip(weights, queries, strict=True):
                 for chunk_id, score in self.vs.similarity(query, missing).items():
-                    dense_scores[chunk_id] = max(dense_scores.get(chunk_id, 0.0), score)
+                    dense_scores[chunk_id] = max(dense_scores.get(chunk_id, 0.0), score * weight)
 
         # Score fusion: meaning first, plus a bonus for matching the question's
         # informative words. A weak, incidental keyword match adds almost nothing.

@@ -3,9 +3,10 @@
 A voice agent that answers and places phone calls, answers questions from your own documents, and books or cancels appointments — with a web console to run it all.
 
 - **Speaks and listens** in English and Indian languages (Sarvam AI speech-to-text and text-to-speech).
-- **Answers from your knowledge base** — PDFs, web pages and text you upload — instead of guessing.
+- **Answers from your knowledge base** — PDFs, web pages and text you upload — instead of guessing, with numbered citations to the passages it used.
 - **Books real appointments** through Cal.com, with a confirmation step and a spoken reference number.
 - **Works on the phone** through LiveKit and a Vobiz SIP trunk, inbound and outbound.
+- **Measured, not guessed**: every turn is traced (timings, model, passages, cost, caller rating), and a built-in evaluation suite scores retrieval, answers and booking dialogs, with quality gates in CI.
 - **Runs without any accounts** for a first look: with no keys set, bookings use a local mock calendar.
 
 ## How it works
@@ -13,7 +14,7 @@ A voice agent that answers and places phone calls, answers questions from your o
 ```text
                         ┌──────────────── Web console (browser) ────────────────┐
                         │ Overview · Playground · Knowledge base · Appointments │
-                        │ Calls · Evaluation                                    │
+                        │ Calls · Monitoring · Evaluation                       │
                         └──────────────┬───────────────────────────┬────────────┘
                                  REST  │                 WebSocket │ /ws/voice
                         ┌──────────────▼───────────────────────────▼────────────┐
@@ -21,9 +22,9 @@ A voice agent that answers and places phone calls, answers questions from your o
                         │  auth · rate limits · request ids · security headers  │
                         └───┬───────────────┬────────────────┬──────────────┬───┘
                             │               │                │              │
-                    Voice pipeline     Knowledge base    Booking dialog   Call log
-                    STT → LLM → TTS    ChromaDB +        state machine    SQLite
-                    (streamed)         local embeddings  → Cal.com
+                    Voice pipeline     Knowledge base    Booking dialog   Call log,
+                    STT → LLM → TTS    ChromaDB + BM25   state machine    traces, eval
+                    (streamed)         hybrid search     → Cal.com        runs (SQLite)
                             │                                  ▲              ▲
    Phone ── Vobiz SIP ── LiveKit ── Telephony worker ──────────┴──────────────┘
                                    (telephony_vobiz.py: same knowledge base,
@@ -31,6 +32,10 @@ A voice agent that answers and places phone calls, answers questions from your o
 ```
 
 **Latency.** The LLM answer is streamed, cut into sentences as it arrives, and each sentence is sent to text-to-speech while the model is still writing. The caller hears the first sentence without waiting for the whole answer. The Playground shows a per-turn latency waterfall, including time to first audio.
+
+**Interruptions.** In hands-free mode the console listens continuously, sends what you said when you pause, and stops the agent mid-sentence if you start talking (barge-in): playback stops at once and the server cancels the rest of that answer.
+
+**Reliability.** The LLM providers form a fallback chain. A provider that fails with a lasting error (bad key, exhausted quota, unknown model) is benched for a while by a circuit breaker, so later turns skip it instead of waiting for it to fail again; a provider that stalls mid-answer is abandoned for the next one.
 
 **Grounding.** Questions are answered only from retrieved passages. On phone calls the LLM has tools (`search_knowledge_base`, `check_availability`, `book_appointment`, `cancel_appointment`, `end_call`), so it can only claim a booking that the calendar actually accepted.
 
@@ -71,7 +76,7 @@ cp .env.example .env
 Edit `.env`: set `SARVAM_API_KEY` and one of `OPENAI_API_KEY` / `GROQ_API_KEY`. Everything else is optional.
 
 ```bash
-python scripts/seed_kb.py sample_doc/knowledge_base.txt
+python scripts/seed_kb.py sample_doc/knowledge_base.txt sample_doc/clinic_faq.md
 ```
 
 ```bash
@@ -79,6 +84,77 @@ python app.py
 ```
 
 Open <http://127.0.0.1:8001>. The first start downloads a small embedding model, so it takes a little longer.
+
+**Upgrading from an earlier version?** The knowledge base is now split by document structure and embedded with a stronger model. Rebuild it once:
+
+```bash
+python scripts/reindex_kb.py
+```
+
+If the server finds an index built with a different embedding model, it says so and asks you to run this, rather than returning poor matches.
+
+## The console
+
+| Page | What it is for |
+|---|---|
+| **Overview** | Conversations and latency over the last 24 hours, latest answer quality score, next appointments and the status of every component. |
+| **Playground** | Talk (hands-free or push-to-talk, hold <kbd>Space</kbd>) or type to the agent. Each answer shows its sources; the inspector shows where the time went, the model used, cost, and the exact passages retrieved. Rate answers with 👍 / 👎. |
+| **Knowledge base** | Add PDFs, web pages and text. *Try a search* shows exactly which passages the agent would read for a question. |
+| **Appointments**, **Calls** | Book, cancel and review appointments; place calls and read the call log. |
+| **Monitoring** | Time-to-first-audio p50/p95 against your budget, turns and errors over time, median time per stage, the fallback chain with benched providers, cost, caller ratings, and every turn with its full trace. Export poorly rated answers as draft test cases. |
+| **Evaluation** | Run the retrieval, answer and booking-dialog suites and see scores, gates and failing cases. |
+
+<kbd>Ctrl</kbd>+<kbd>K</kbd> opens a command palette. Light and dark themes follow the system and can be switched.
+
+## Retrieval
+
+Each document is split along its headings into passages of about 600 characters. Every passage carries its document and section path (*Clinic handbook › Payment and insurance*), which helps both search and citations. A question is then searched two ways:
+
+- **by meaning**, with `all-MiniLM-L6-v2` embeddings, and
+- **by keywords**, with BM25 (stemmed, so *cancelling* matches *cancellation*; Hinglish filler words are ignored).
+
+The two scores are fused: meaning first, plus a bonus for passages that contain the question's informative words. Passages far below the best match are dropped so the model is not distracted. A **follow-up** such as *"And is it covered by insurance?"* is also searched together with the previous exchange, but matches that only come from that context are discounted, so the new topic ranks first. An optional cross-encoder re-ranker can be switched on with `ENABLE_RERANKER=true`.
+
+Measured on the golden set (55 answerable questions about the sample documents, scored by whether the passage containing the answer's evidence was retrieved):
+
+| | Before | Now |
+|---|---|---|
+| Answer in the passages given to the model | 90.7% | **98.2%** |
+| Answer in the top passage | 85.2% | **96.4%** |
+| Mean reciprocal rank | 0.880 | **0.973** |
+| Share of retrieved passages that are relevant | 47% | **82%** |
+| Follow-up questions | 75% | **100%** |
+| Hinglish (code-mixed) questions | 50% | **100%** |
+
+*Before* is the previous fixed-size splitter with dense search only, measured on the same questions (54 at the time; one follow-up case was added since).
+
+## Monitoring and evaluation
+
+**Tracing.** Every turn — phone, voice and text — is recorded: question, the query actually searched, passages and scores, model and whether it was a fallback, per-stage timings, tokens and estimated cost. Emails and phone numbers are masked; set `TRACE_STORE_TEXT=false` to keep timings without any text. Traces older than `TRACE_RETENTION_DAYS` are deleted.
+
+**Evaluation.** Three suites, runnable from the console or the command line:
+
+| Suite | What it checks | Cost |
+|---|---|---|
+| `retrieval` | Whether the passage with the answer is retrieved and ranked first; precision of what is retrieved. | free, seconds |
+| `dialog` | 11 scripted booking conversations: confirmation, refusal, changes of mind, cancellation, past dates, closed hours. | free, instant |
+| `answers` | Generates real answers and grades them with an LLM judge for correctness, faithfulness to the passages, refusing when the answer is not in the documents, and being speakable (no markdown, short). | uses your LLM |
+
+```bash
+python -m evaluation run --suite all --html eval-report.html
+```
+
+The command exits with an error when a score falls below its threshold in [`evaluation/thresholds.json`](evaluation/thresholds.json); CI runs the retrieval and dialog suites on every change. To evaluate **your own** documents, generate questions from them, review the file, then run against the live knowledge base:
+
+```bash
+python -m evaluation generate --limit 30
+```
+
+```bash
+python -m evaluation run --suite retrieval --kb live
+```
+
+Answers rated 👎 in the console can be turned into draft test cases with `python -m evaluation export-feedback` (or *Export low-rated answers* on the Monitoring page).
 
 ## Configuration
 
@@ -97,6 +173,12 @@ All settings are environment variables (see [`.env.example`](.env.example) for t
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Telephony. | none |
 | `VOBIZ_*`, `OUTBOUND_TRUNK_ID` | SIP trunk for phone calls. | none |
 | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_EXPENSIVE_PER_MINUTE` | Per-client request limits. | 120, 30 |
+| `EMBEDDING_MODEL` | Sentence-transformers model for the knowledge base. Changing it requires `scripts/reindex_kb.py`. | `all-MiniLM-L6-v2` |
+| `RETRIEVAL_MODE`, `LEXICAL_WEIGHT` | `hybrid` (meaning + keywords) or `dense`; weight of the keyword match. | `hybrid`, 0.2 |
+| `TOP_K_RETRIEVAL`, `RELEVANCE_MARGIN` | Passages given to the model; how far below the best match a passage may score. | 3, 0.15 |
+| `ENABLE_RERANKER` | Cross-encoder re-ranking of the candidates. | `false` |
+| `LLM_STALL_TIMEOUT_SEC`, `LLM_REASONING_EFFORT` | Abandon a provider that stops streaming; reasoning effort for gpt-oss / o-series models. | 8, `low` |
+| `TRACING_ENABLED`, `TRACE_STORE_TEXT`, `TRACE_RETENTION_DAYS` | Per-turn tracing for the Monitoring page. | on, on, 30 |
 
 The server checks its configuration at start-up and refuses to run with unsafe production settings.
 
@@ -135,16 +217,19 @@ Interactive documentation is served at `/docs` in development.
 |---|---|---|
 | `GET /healthz` | Liveness probe; calls nothing external. | public |
 | `GET /health` | Component status for the console. | public |
-| `WS /ws/voice` | Voice and chat turns with conversation memory. | public, rate limited |
+| `WS /ws/voice` | Voice and chat turns with conversation memory; `{"type": "cancel"}` stops the answer in progress. | public, rate limited |
 | `POST /query` | One-off question against the knowledge base. | public, rate limited |
 | `GET /booking/slots?date=YYYY-MM-DD` | Open appointment times. | public |
 | `POST /booking/intent` | Natural-language booking in one request. | public, rate limited |
 | `POST /ingest/text`, `/ingest/url`, `/ingest/pdf` | Add knowledge-base sources. | admin |
 | `GET /kb/sources`, `DELETE /kb/sources`, `DELETE /kb/clear` | Manage sources. | admin |
+| `GET /kb/search?q=` | The passages the agent would retrieve for a question, with scores. | admin |
 | `POST /booking/create`, `/booking/cancel` | Manage appointments. | admin |
 | `GET /booking/history`, `/booking/stats`, `/booking/list` | Read appointments. | admin |
 | `GET /calls`, `POST /calls/outbound` | Call log; place a call. | admin |
-| `GET /benchmark?n=5` | Run the evaluation set. | admin |
+| `POST /feedback` | Rate an answer (helpful / not helpful) by its trace id. | public, rate limited |
+| `GET /ops/summary`, `/ops/timeseries`, `/ops/traces`, `/ops/traces/{id}`, `/ops/export` | Monitoring: percentiles, rates, cost, provider health, traces, low-rated answers as JSONL. | admin |
+| `POST /evaluation/runs`, `GET /evaluation/runs`, `/evaluation/runs/{id}`, `/evaluation/datasets`, `POST /evaluation/generate` | Run and read evaluations; generate questions from your documents. | admin |
 
 Admin requests carry the token as `X-Admin-Token: <token>` or `Authorization: Bearer <token>`.
 
@@ -175,13 +260,9 @@ pytest
 ruff check .
 ```
 
-The suite (300+ tests) runs offline in a few seconds: providers are replaced by fakes, the calendar by mock mode, and the clock is frozen. It covers the booking language understanding and dialog, the Cal.com client, the provider fallback chain, the streaming voice pipeline, knowledge-base storage, URL-fetch protections, every API route including authentication and limits, the WebSocket protocol, and the phone agent's tools.
+The suite (390+ tests) runs offline in a few seconds: providers are replaced by fakes, the calendar by mock mode, and the clock is frozen. It covers the booking language understanding and dialog, the Cal.com client, the provider fallback chain and circuit breaker, the streaming voice pipeline and barge-in, chunking, keyword and hybrid retrieval, tracing, the evaluation metrics and judge parsing, URL-fetch protections, every API route including authentication and limits, the WebSocket protocol, and the phone agent's tools.
 
-To measure answer quality and speed against your own knowledge base:
-
-```bash
-python -m voice_agent.benchmark --queries 20 --html report.html
-```
+Quality is measured separately by the evaluation suites (see [Monitoring and evaluation](#monitoring-and-evaluation)).
 
 ## Deployment
 
@@ -208,15 +289,19 @@ voice_agent/
   config.py                 Settings and start-up validation
   pipeline.py               Voice / chat turn orchestration (streamed STT → LLM → TTS)
   sarvam_client.py          Speech and multi-provider LLM client
-  rag_pipeline.py           Retrieval and answer generation
+  rag_pipeline.py           Hybrid retrieval, follow-ups, citations, answer generation
+  chunking.py               Structure-aware splitting with section headers
+  lexical.py                BM25 keyword index
   vector_store.py           ChromaDB knowledge base
   document_processor.py     PDF / URL / text ingestion
+  speech.py                 Makes answers speakable (no markdown, ₹ → rupees)
+  tracing.py                Per-turn traces, summaries and time series
   booking/                  nlu.py · dialog.py · calcom.py · store.py
   telephony/                agent.py · tools.py · outbound.py
   server/                   app.py · security.py · schemas.py · routes/
-evaluation/                 Evaluation question set, metrics and report
-static/                     Web console (no build step)
-scripts/                    seed_kb.py · check_llm.py · check_calcom.py
+evaluation/                 Golden questions, dialog scenarios, metrics, LLM judge, CLI, report
+static/                     Web console: ES modules, no build step, self-hosted font
+scripts/                    seed_kb.py · reindex_kb.py · check_llm.py · check_calcom.py
 tests/                      Test suite
 ```
 

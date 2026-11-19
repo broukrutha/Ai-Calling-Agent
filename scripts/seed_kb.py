@@ -21,7 +21,7 @@ from voice_agent.vector_store import VectorStore  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Add files or web pages to the knowledge base.")
-    parser.add_argument("sources", nargs="+", help="paths to .pdf / .txt files, or http(s) URLs")
+    parser.add_argument("sources", nargs="+", help="paths to .pdf / .txt / .md files, or http(s) URLs")
     args = parser.parse_args()
 
     configure_logging()

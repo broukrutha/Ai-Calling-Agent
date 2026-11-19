@@ -55,6 +55,8 @@ def _save(run_id: str, **fields: Any) -> None:
 def _row(row: Any, full: bool) -> dict[str, Any]:
     data = dict(row)
     results = json.loads(data.pop("summary") or "[]")
+    if not isinstance(results, list):      # a run that has not finished a suite yet
+        results = []
     data["suites"] = [
         {"suite": item.get("suite"), "kb": item.get("kb"), "gates_passed": item.get("gates_passed"),
          "headline": _headline(item), "failed": item.get("failed", [])[:20]}
