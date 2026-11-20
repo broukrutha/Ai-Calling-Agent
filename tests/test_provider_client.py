@@ -95,7 +95,7 @@ async def test_generate_falls_back_when_the_first_provider_is_rate_limited(monke
     result = await client.generate("hello")
     assert result.answer == "Groq says hi" and result.provider == "groq"
     assert (result.input_tokens, result.output_tokens) == (12, 5)
-    assert seen == ["api.openai.com", "api.openai.com", "api.groq.com"]      # one retry, then fall through
+    assert seen == ["api.openai.com", "api.groq.com"]      # no retry into a rate limit: fall through
 
 
 async def test_generate_does_not_retry_a_bad_api_key(monkeypatch):
@@ -215,3 +215,93 @@ def test_client_requires_a_sarvam_key(monkeypatch):
     monkeypatch.setattr(config, "SARVAM_API_KEY", "")
     with pytest.raises(ValueError):
         SarvamClient()
+
+
+# ── Circuit breaker, reasoning models, complete() ────────────────────────────
+
+async def test_quota_exhausted_provider_is_benched(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.host)
+        if request.url.host == "api.openai.com":
+            return httpx.Response(429, json={"error": {"code": "insufficient_quota", "message": "You exceeded your current quota"}})
+        return chat_response("from groq")
+
+    client = make_client(monkeypatch, handler)
+    assert (await client.generate("one")).provider == "groq"
+    assert (await client.generate("two")).provider == "groq"
+    assert seen == ["api.openai.com", "api.groq.com", "api.groq.com"]       # OpenAI is not retried
+    state = {p["name"]: p for p in (await client.health_check())["providers"]}
+    assert state["openai"]["state"] == "open" and state["openai"]["reason"] == "quota exhausted"
+    assert state["groq"]["state"] == "closed"
+
+
+@pytest.mark.parametrize("status,body,reason", [
+    (401, "bad key", "API key rejected"),
+    (404, '{"error": {"code": "model_not_found"}}', "model not found"),
+    (400, "bad request", "request rejected"),
+])
+async def test_breaker_reasons(monkeypatch, status, body, reason):
+    client = make_client(monkeypatch, lambda r: httpx.Response(status, text=body) if r.url.host == "api.openai.com" else chat_response("ok"))
+    await client.generate("hi")
+    assert client.breaker.state("openai")["reason"] == reason
+
+
+async def test_transient_errors_bench_only_after_repeating(monkeypatch):
+    client = make_client(monkeypatch, lambda r: httpx.Response(503, text="busy") if r.url.host == "api.openai.com" else chat_response("ok"))
+    await client.generate("one")
+    assert client.breaker.available("openai")
+    await client.generate("two")
+    assert not client.breaker.available("openai")
+
+
+async def test_benched_providers_are_still_tried_when_nothing_else_is_left(monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.host)
+        return chat_response("recovered")
+
+    client = make_client(monkeypatch, handler, groq="")
+    client.breaker.failure("openai", 401)
+    client.breaker.failure("sarvam", 401)
+    assert (await client.generate("hi")).answer == "recovered"
+    assert client.breaker.available("openai")                       # a success closes the breaker
+
+
+def test_reasoning_models_get_reasoning_parameters(monkeypatch):
+    client = make_client(monkeypatch, lambda r: chat_response("x"))
+    groq = next(p for p in client.providers if p.name == "groq")
+    reasoning = type(groq)(name="groq", url=groq.url, model="openai/gpt-oss-120b", headers=groq.headers)
+    payload = client._payload(reasoning, [], stream=False)
+    assert payload["reasoning_effort"] == "low" and payload["max_completion_tokens"] >= 1024
+    assert "max_tokens" not in payload
+    plain = client._payload(groq, [], stream=True)
+    assert plain["max_tokens"] == config.LLM_MAX_TOKENS and "reasoning_effort" not in plain and plain["stream"] is True
+
+
+async def test_stalled_stream_falls_over_to_the_next_provider(monkeypatch):
+    def handler(request):
+        if request.url.host == "api.openai.com":
+            raise httpx.ReadTimeout("stalled", request=request)
+        return sse("Groq ", "answer")
+
+    client = make_client(monkeypatch, handler)
+    stats = LLMStreamStats()
+    assert "".join([t async for t in client.generate_stream("hi", stats=stats)]) == "Groq answer"
+    assert stats.provider == "groq" and stats.fallback is True
+
+
+async def test_complete_sends_the_given_messages(monkeypatch):
+    sent = {}
+
+    def handler(request):
+        sent.update(json.loads(request.content))
+        return chat_response('{"ok": true}')
+
+    client = make_client(monkeypatch, handler)
+    result = await client.complete([{"role": "user", "content": "grade this"}], max_tokens=50, temperature=0.0)
+    assert result.answer == '{"ok": true}'
+    assert sent["messages"] == [{"role": "user", "content": "grade this"}]
+    assert sent["max_tokens"] == 50 and sent["temperature"] == 0.0

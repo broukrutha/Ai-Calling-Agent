@@ -29,7 +29,7 @@ from voice_agent.logging_config import configure_logging, request_id_var
 from voice_agent.sarvam_client import ProviderError
 from voice_agent.server import security
 from voice_agent.server.deps import AgentUnavailableError, Services
-from voice_agent.server.routes import booking, calls, chat, health, knowledge, voice_ws
+from voice_agent.server.routes import booking, calls, chat, evaluation, health, knowledge, ops, voice_ws
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,9 @@ async def _lifespan(app: FastAPI):
     logger.info("AI Calling Agent %s started (%s)", __version__, config.APP_ENV)
     yield
 
+    task = getattr(app.state, "eval_task", None)
+    if task is not None and not task.done():
+        task.cancel()
     await services.close()
     await calcom.close()
     store.close()
@@ -120,7 +123,7 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     _register_error_handlers(app)
 
-    for module in (health, knowledge, chat, booking, calls, voice_ws):
+    for module in (health, knowledge, chat, booking, calls, ops, evaluation, voice_ws):
         app.include_router(module.router)
 
     if STATIC_DIR.exists():

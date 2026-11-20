@@ -14,9 +14,12 @@ API error bodies go to the log, never to the caller.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -58,8 +61,21 @@ async def close() -> None:
     _client = None
 
 
+_force_mock: contextvars.ContextVar[bool] = contextvars.ContextVar("calendar_force_mock", default=False)
+
+
 def is_mock_mode() -> bool:
-    return not config.CAL_API_KEY
+    return _force_mock.get() or not config.CAL_API_KEY
+
+
+@contextmanager
+def mock_calendar() -> Iterator[None]:
+    """Use the mock calendar in this task only (evaluation runs)."""
+    token = _force_mock.set(True)
+    try:
+        yield
+    finally:
+        _force_mock.reset(token)
 
 
 def _headers(api_version: str, *, json_body: bool = False) -> dict[str, str]:

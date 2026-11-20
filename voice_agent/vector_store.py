@@ -1,8 +1,9 @@
 """
 Knowledge-base storage: ChromaDB with local sentence-transformer embeddings.
 
-* Chunk ids are derived from the content, so ingesting the same document
-  twice updates it instead of duplicating every chunk.
+* Ingesting a source replaces whatever was stored for it before, so updating a
+  document never leaves stale chunks behind. Chunk ids are derived from the
+  content.
 * ``version`` increases on every change; the answer cache uses it to drop
   answers that were generated from an older knowledge base.
 * If the embedding model cannot be loaded the store reports itself as
@@ -15,6 +16,7 @@ import hashlib
 import logging
 import threading
 from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.documents import Document
@@ -57,6 +59,16 @@ def _clean_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     return cleaned
 
 
+@dataclass
+class Candidate:
+    """A stored chunk returned by a search."""
+
+    id: str
+    text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    score: float = 0.0          # cosine similarity, 0–1 (dense search only)
+
+
 class VectorStore:
     """Add, search and manage knowledge-base chunks."""
 
@@ -69,6 +81,9 @@ class VectorStore:
         self._persist_dir = persist_dir or config.CHROMA_PERSIST_DIR
         self._name = collection_name or config.CHROMA_COLLECTION_NAME
         self._embedder = embedding_function
+        # The configured model is checked against the one the index was built
+        # with; an injected embedding function (tests, evaluation) is trusted.
+        self._model_name = config.EMBEDDING_MODEL if embedding_function is None else ""
         self._client: Any = None
         self._collection: Any = None
         self._available = False
@@ -83,6 +98,7 @@ class VectorStore:
                 self._embedder = _default_embedder()
             self._client = chromadb.PersistentClient(path=self._persist_dir)
             self._collection = self._open_collection()
+            self._check_model()
             self._available = True
             logger.info("Knowledge base ready: '%s' (%d chunks)", self._name, self._collection.count())
         except Exception as exc:
@@ -90,11 +106,48 @@ class VectorStore:
             logger.exception("Knowledge base unavailable — continuing without document retrieval.")
 
     def _open_collection(self) -> Any:
-        return self._client.get_or_create_collection(
-            name=self._name,
-            embedding_function=self._embedder,
-            metadata={"hnsw:space": "cosine"},
-        )
+        existing = {getattr(item, "name", item) for item in self._client.list_collections()}
+        if self._name in existing:
+            try:
+                return self._client.get_collection(name=self._name, embedding_function=self._embedder)
+            except ValueError as exc:
+                if "embedding function" in str(exc).lower():
+                    raise RuntimeError(
+                        "The knowledge base was built with a different embedding model. Set EMBEDDING_MODEL "
+                        "back to it, or rebuild the index with: python scripts/reindex_kb.py"
+                    ) from exc
+                raise
+        metadata: dict[str, Any] = {"hnsw:space": "cosine"}
+        if self._model_name:
+            metadata["embedding_model"] = self._model_name
+        return self._client.create_collection(name=self._name, embedding_function=self._embedder, metadata=metadata)
+
+    def stored_model(self) -> str:
+        """The embedding model the index was built with, when it can be told."""
+        name = (self._collection.metadata or {}).get("embedding_model", "")
+        if not name:
+            try:
+                settings = getattr(self._collection, "configuration_json", None) or {}
+                name = ((settings.get("embedding_function") or {}).get("config") or {}).get("model_name", "")
+            except Exception:
+                name = ""
+        return str(name or "")
+
+    def _check_model(self) -> None:
+        """Querying vectors built by another model returns confident nonsense: refuse instead."""
+        if not self._model_name:
+            return
+        stored = self.stored_model()
+
+        def short(name: str) -> str:
+            return name.strip().lower().removeprefix("sentence-transformers/")
+
+        if stored and short(stored) != short(self._model_name):
+            raise RuntimeError(
+                f"The knowledge base was built with the embedding model '{stored}' but EMBEDDING_MODEL is "
+                f"'{self._model_name}'. Set EMBEDDING_MODEL={stored}, or rebuild the index with: "
+                "python scripts/reindex_kb.py"
+            )
 
     def is_available(self) -> bool:
         return self._available
@@ -105,8 +158,13 @@ class VectorStore:
 
     # ── Write ────────────────────────────────────────────────────────────────
 
-    def add_documents(self, docs: list[Document]) -> int:
-        """Embed and store chunks. Returns how many distinct chunks were written."""
+    def add_documents(self, docs: list[Document], replace: bool = True) -> int:
+        """
+        Embed and store chunks. Returns how many distinct chunks were written.
+
+        With ``replace`` (the default) every source in ``docs`` is first removed,
+        so a re-ingested document fully supersedes its previous version.
+        """
         self._require_available()
         unique: dict[str, tuple[str, dict[str, Any]]] = {}
         for doc in docs:
@@ -119,7 +177,14 @@ class VectorStore:
             return 0
 
         ids = list(unique)
+        sources = {str(metadata["source"]) for _, metadata in unique.values()}
         with self._lock:
+            if replace:
+                for source in sources:
+                    stale = self._collection.get(where={"source": source}, include=[])["ids"]
+                    stale = [chunk_id for chunk_id in stale if chunk_id not in unique]
+                    if stale:
+                        self._collection.delete(ids=stale)
             for start in range(0, len(ids), _BATCH_SIZE):
                 batch = ids[start:start + _BATCH_SIZE]
                 self._collection.upsert(
@@ -146,11 +211,64 @@ class VectorStore:
         self._require_available()
         with self._lock:
             self._client.delete_collection(self._name)
-            self._collection = self._open_collection()
+            self._collection = self._open_collection()  # recreated with the configured model
             self.version += 1
         logger.info("Knowledge base cleared.")
 
     # ── Read ─────────────────────────────────────────────────────────────────
+
+    def dense_search(self, queries: list[str], n: int) -> list[list[Candidate]]:
+        """Nearest chunks for each query, best first, with no score cut-off."""
+        if not self._available or not queries:
+            return [[] for _ in queries]
+        results = self._collection.query(
+            query_texts=queries,
+            n_results=max(n, 1),
+            include=["documents", "metadatas", "distances"],
+        )
+        out: list[list[Candidate]] = []
+        for position in range(len(queries)):
+            ids = (results.get("ids") or [[]])[position]
+            documents = (results.get("documents") or [[]])[position]
+            metadatas = (results.get("metadatas") or [[]])[position]
+            distances = (results.get("distances") or [[]])[position]
+            out.append([
+                Candidate(id=chunk_id, text=text, metadata=dict(metadata or {}), score=round(1.0 - float(distance), 4))
+                for chunk_id, text, metadata, distance in zip(ids, documents, metadatas, distances, strict=False)
+            ])
+        return out
+
+    def similarity(self, query: str, ids: list[str]) -> dict[str, float]:
+        """Cosine similarity between ``query`` and specific stored chunks."""
+        if not self._available or not ids:
+            return {}
+        import numpy as np
+
+        stored = self._collection.get(ids=ids, include=["embeddings"])
+        vectors = stored.get("embeddings")
+        if vectors is None or len(vectors) == 0:
+            return {}
+        query_vector = np.asarray(self._embedder([query])[0], dtype=float)
+        matrix = np.asarray(vectors, dtype=float)
+        norms = np.linalg.norm(matrix, axis=1) * (np.linalg.norm(query_vector) or 1.0)
+        similarities = matrix @ query_vector / np.where(norms == 0, 1.0, norms)
+        return {chunk_id: round(float(value), 4) for chunk_id, value in zip(stored["ids"], similarities, strict=True)}
+
+    def all_chunks(self) -> list[Candidate]:
+        """Every stored chunk (for building the keyword index)."""
+        if not self._available:
+            return []
+        data = self._collection.get(include=["documents", "metadatas"])
+        return [
+            Candidate(id=chunk_id, text=text or "", metadata=dict(metadata or {}))
+            for chunk_id, text, metadata in zip(
+                data.get("ids") or [], data.get("documents") or [], data.get("metadatas") or [], strict=False
+            )
+        ]
+
+    def signature(self) -> tuple[int, int]:
+        """Changes whenever the stored chunks change (used to invalidate caches)."""
+        return (self.version, self.count())
 
     def retrieve(self, query: str, k: int | None = None) -> list[tuple[Document, float]]:
         """The ``k`` most relevant chunks with a 0–1 relevance score, best first."""
@@ -190,6 +308,8 @@ class VectorStore:
             "embedding_model": config.EMBEDDING_MODEL,
             "status": "ready" if self._available else "degraded",
             "available": self._available,
+            "retrieval": config.RETRIEVAL_MODE,
+            "error": self._init_error if self._init_error and "embedding model" in self._init_error else None,
         }
 
     @property

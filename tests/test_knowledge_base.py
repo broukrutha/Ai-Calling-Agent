@@ -84,7 +84,7 @@ def test_store_degrades_instead_of_crashing_when_embeddings_fail(tmp_path, monke
 def test_text_is_chunked_with_its_source():
     docs = dp.ingest("word " * 600, "text", name="Company FAQ")
     assert len(docs) > 1 and all(d.metadata["source"] == "Company FAQ" for d in docs)
-    assert all(len(d.page_content) <= 512 for d in docs)
+    assert all(len(d.page_content) <= dp.config.CHUNK_SIZE for d in docs)
 
 
 @pytest.mark.parametrize("source,kind", [("", "text"), ("   ", "text"), ("x", "carrier-pigeon")])
@@ -103,7 +103,7 @@ def test_pdf_round_trip_and_rejection_of_non_pdfs():
 
     [doc] = dp.ingest(data, "pdf", name="prices.pdf")
     assert "five hundred rupees" in doc.page_content
-    assert doc.metadata == {"source": "prices.pdf", "page": 1}
+    assert doc.metadata == {"source": "prices.pdf", "page": 1, "title": "prices", "chunk": 0}
 
     with pytest.raises(IngestError, match="not a valid PDF"):
         dp.ingest(b"MZ\x90\x00 definitely an exe", "pdf", name="evil.pdf")

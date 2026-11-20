@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
@@ -58,6 +59,26 @@ async def kb_info(services: Services = Depends(get_services)) -> dict:
 async def kb_sources(services: Services = Depends(get_services)) -> dict:
     sources = await asyncio.to_thread(services.vector_store.sources)
     return {"status": "ok", "sources": sources}
+
+
+@router.get("/kb/search", tags=["Knowledge Base"], dependencies=[Depends(require_admin), Depends(rate_limit())])
+async def kb_search(
+    q: str = Query(min_length=1, max_length=500),
+    k: int | None = Query(default=None, ge=1, le=10),
+    services: Services = Depends(get_services),
+) -> dict:
+    """Run the agent's retrieval for ``q`` and show the passages it would read."""
+    store = services.vector_store
+    if not store.is_available():
+        raise HTTPException(status_code=503, detail="The knowledge base is unavailable: the embedding model could not be loaded.")
+    started = time.perf_counter()
+    passages, searched, _ = await asyncio.to_thread(services.retriever.search, q.strip(), None, k)
+    return {
+        "status": "ok",
+        "query": searched,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        "citations": [passage.citation(number) for number, passage in enumerate(passages, start=1)],
+    }
 
 
 @router.delete("/kb/sources", tags=["Knowledge Base"], dependencies=[Depends(require_admin)])
