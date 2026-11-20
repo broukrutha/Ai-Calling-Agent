@@ -106,6 +106,12 @@ If the server finds an index built with a different embedding model, it says so 
 
 <kbd>Ctrl</kbd>+<kbd>K</kbd> opens a command palette. Light and dark themes follow the system and can be switched.
 
+**Design.**
+- **Colour:** two 12-step scales, a cool neutral and an indigo accent, generated in OKLCH. Like Linear's LCH themes and Stripe's Lab palette, equal steps look equal. Step roles follow Radix Colors.
+- **Contrast:** every text/background pair meets WCAG AA (4.5:1) in both themes. [`scripts/generate_palette.py`](scripts/generate_palette.py) prints the tokens and the contrast report, and a test fails if `static/style.css` drifts from it or drops below AA.
+- **Charts:** a categorical palette validated for colour-blind separation. Headline numbers show the change against the previous period.
+- **Type:** Inter (with display optical sizes) and Geist Mono, both self-hosted under the OFL.
+
 ## Retrieval
 
 Each document is split along its headings into passages of about 600 characters. Every passage carries its document and section path (*Clinic handbook › Payment and insurance*), which helps both search and citations. A question is then searched two ways:
@@ -301,7 +307,7 @@ voice_agent/
   server/                   app.py · security.py · schemas.py · routes/
 evaluation/                 Golden questions, dialog scenarios, metrics, LLM judge, CLI, report
 static/                     Web console: ES modules, no build step, self-hosted font
-scripts/                    seed_kb.py · reindex_kb.py · check_llm.py · check_calcom.py
+scripts/                    seed_kb.py · reindex_kb.py · generate_palette.py · check_llm.py · check_calcom.py
 tests/                      Test suite
 ```
 

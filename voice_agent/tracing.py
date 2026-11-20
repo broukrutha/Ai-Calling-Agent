@@ -145,12 +145,14 @@ def _window_start(window: str) -> datetime:
     return datetime.now(timezone.utc) - WINDOWS.get(window, WINDOWS["24h"])
 
 
-def _rows_since(start: datetime, limit: int = 50_000) -> list[dict[str, Any]]:
+def _rows_since(start: datetime, limit: int = 50_000, end: datetime | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM traces WHERE created_at >= ?"
+    params: list[Any] = [start.strftime("%Y-%m-%dT%H:%M:%S")]
+    if end is not None:
+        query += " AND created_at < ?"
+        params.append(end.strftime("%Y-%m-%dT%H:%M:%S"))
     with store.connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM traces WHERE created_at >= ? ORDER BY created_at ASC LIMIT ?",
-            (start.strftime("%Y-%m-%dT%H:%M:%S"), limit),
-        ).fetchall()
+        rows = conn.execute(query + " ORDER BY created_at ASC LIMIT ?", (*params, limit)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -161,9 +163,26 @@ def _latency_block(rows: list[dict[str, Any]], field: str) -> dict[str, float | 
     return {"p50": round(percentile(values, 0.5), 1), "p95": round(percentile(values, 0.95), 1), "count": len(values)}
 
 
+def _headline(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The few numbers compared with the previous period."""
+    turns = len(rows)
+    rated = [row for row in rows if row["rating"] in (1, -1)]
+    first_audio = _latency_block(rows, "first_audio_ms")
+    return {
+        "turns": turns,
+        "error_rate": round(sum(1 for row in rows if row["kind"] == "error") / turns, 4) if turns else None,
+        "first_audio_p50": first_audio["p50"],
+        "total_p50": _latency_block(rows, "total_ms")["p50"],
+        "cost_inr": round(sum(row["cost_inr"] for row in rows), 4),
+        "helpful_rate": round(sum(1 for row in rated if row["rating"] == 1) / len(rated), 4) if rated else None,
+    }
+
+
 def summary(window: str = "24h") -> dict[str, Any]:
-    """Headline numbers for the monitoring dashboard."""
-    rows = _rows_since(_window_start(window))
+    """Headline numbers for the monitoring dashboard, with the previous period for trends."""
+    start = _window_start(window)
+    rows = _rows_since(start)
+    previous = _rows_since(start - WINDOWS.get(window, WINDOWS["24h"]), end=start)
     answers = [row for row in rows if row["kind"] == "answer"]
     llm_answers = [row for row in answers if not row["cached"]]
     rated = [row for row in rows if row["rating"] in (1, -1)]
@@ -196,6 +215,7 @@ def summary(window: str = "24h") -> dict[str, Any]:
             "helpful_rate": share(sum(1 for row in rated if row["rating"] == 1), len(rated)),
         },
         "prompt_versions": dict(Counter(row["prompt_version"] for row in rows)),
+        "previous": _headline(previous),
     }
 
 

@@ -74,6 +74,7 @@ function showView(name) {
   });
   const section = $(`view-${view}`);
   $('view-title').textContent = section.dataset.title;
+  $('crumb').textContent = section.dataset.title;
   $('view-subtitle').textContent = section.dataset.subtitle;
   document.title = `${section.dataset.title} · Calling Agent Console`;
   closeNav();
@@ -194,6 +195,37 @@ function renderSystemStatus(health) {
 
 const KIND_TONE = { answer: 'good', booking: 'accent', noise: '', error: 'bad' };
 
+/**
+ * Change against the previous period of the same length, as a chip.
+ * ``lowerIsBetter`` colours a fall green (latency, errors, cost).
+ */
+function trend(current, previous, { lowerIsBetter = false, points = false } = {}) {
+  if (typeof current !== 'number' || typeof previous !== 'number') return null;
+  let change;
+  let label;
+  if (points) {
+    change = (current - previous) * 100;
+    if (Math.abs(change) < 0.05) return { text: 'no change', tone: 'flat', title: 'Same as the previous period' };
+    label = `${Math.abs(change).toFixed(1)} pts`;
+  } else {
+    if (previous === 0) return current === 0 ? { text: 'no change', tone: 'flat' } : { text: 'new', tone: 'flat', title: 'Nothing in the previous period' };
+    change = ((current - previous) / previous) * 100;
+    if (Math.abs(change) < 0.5) return { text: 'no change', tone: 'flat', title: 'Same as the previous period' };
+    label = `${Math.abs(change) >= 10 ? Math.round(Math.abs(change)) : Math.abs(change).toFixed(1)}%`;
+  }
+  const better = lowerIsBetter ? change < 0 : change > 0;
+  return { text: `${change > 0 ? '↑' : '↓'} ${label}`, tone: better ? 'up' : 'down', title: 'Compared with the previous period of the same length' };
+}
+
+function setTrend(node, info) {
+  if (!node) return;
+  node.hidden = !info;
+  if (!info) return;
+  node.textContent = info.text;
+  node.className = `delta ${info.tone}`;
+  node.title = info.title || '';
+}
+
 function traceRow(trace) {
   return el('button', { class: 'row row-button', type: 'button', dataset: { action: 'open-trace', id: trace.id } },
     el('span', { class: `dot ${KIND_TONE[trace.kind] || ''}` }),
@@ -216,6 +248,9 @@ async function loadOverview() {
   if (ops.ok) {
     const s = ops.data;
     countTo($('tile-turns'), s.turns);
+    const before = s.previous || {};
+    setTrend($('delta-turns'), trend(s.turns, before.turns));
+    setTrend($('delta-latency'), trend(s.latency_ms.first_audio_ms.p50 ?? s.latency_ms.total_ms.p50, before.first_audio_p50 ?? before.total_p50, { lowerIsBetter: true }));
     $('tile-turns-foot').textContent = s.turns ? `${pct(s.error_rate ?? 0)} errors · ${pct(s.cache_hit_rate ?? 0, 0)} cached` : 'No conversations yet';
     const latency = (s.latency_ms.first_audio_ms.p50 ?? s.latency_ms.total_ms.p50);
     $('tile-latency').textContent = latency === null || latency === undefined ? '–' : formatMs(latency);
@@ -273,13 +308,14 @@ function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${protocol}//${location.host}/ws/voice`);
   state.ws = socket;
-  socket.addEventListener('open', () => { state.wsRetryMs = 1000; socket.send(JSON.stringify({ type: 'ping' })); });
+  socket.addEventListener('open', () => { state.wsRetryMs = 1000; show($('live-chip'), true); socket.send(JSON.stringify({ type: 'ping' })); });
   socket.addEventListener('message', (event) => {
     let message;
     try { message = JSON.parse(event.data); } catch (_) { return; }
     handleSocketMessage(message);
   });
   socket.addEventListener('close', () => {
+    show($('live-chip'), false);
     finishTurn();
     state.wsTimer = setTimeout(connectWebSocket, state.wsRetryMs);
     state.wsRetryMs = Math.min(state.wsRetryMs * 2, 15000);
@@ -355,9 +391,10 @@ function followTranscript() {
 
 function addMessage(role, text, { streaming = false } = {}) {
   show($('chat-empty'), false);
-  const node = el('div', { class: `msg ${role}${streaming ? ' streaming' : ''}` },
-    el('div', { class: 'msg-who', text: role === 'user' ? 'You' : 'Agent' }),
-    el('div', { class: 'msg-text', text }));
+  const who = role === 'user'
+    ? el('div', { class: 'msg-who sr-only', text: 'You' })
+    : el('div', { class: 'msg-who' }, el('span', { class: 'avatar aurora', 'aria-hidden': 'true' }, el('span', { class: 'aurora-core' })), el('span', { text: 'Agent' }));
+  const node = el('div', { class: `msg ${role}${streaming ? ' streaming' : ''}` }, who, el('div', { class: 'msg-text', text }));
   $('conversation').append(node);
   followTranscript();
   return node;
@@ -756,9 +793,11 @@ async function clearKB() {
 // Appointments
 // ═════════════════════════════════════════════════════════════════════════════
 
-function tile(label, value, tone = '', foot = '') {
+function tile(label, value, tone = '', foot = '', change = null) {
+  const chip = change ? el('span', { class: `delta ${change.tone}`, text: change.text, title: change.title || '' }) : null;
   return el('div', { class: 'tile' }, el('div', { class: 'tile-label', text: label }),
-    el('div', { class: `tile-value ${tone}`.trim(), text: String(value) }), foot ? el('div', { class: 'tile-foot', text: foot }) : null);
+    el('div', { class: `tile-value ${tone}`.trim(), text: String(value) }),
+    foot || chip ? el('div', { class: 'tile-foot' }, chip, foot ? el('span', { text: foot }) : null) : null);
 }
 
 function initBookingDate() {
@@ -936,13 +975,16 @@ async function loadMonitoring() {
   }
   const s = summary.data;
   const firstAudio = s.latency_ms.first_audio_ms;
+  const before = s.previous || {};
   setContent($('ops-tiles'),
-    tile('Turns', s.turns, '', Object.entries(s.by_channel).map(([k, v]) => `${v} ${k}`).join(' · ') || 'none yet'),
-    tile('First audio p50', formatMs(firstAudio.p50), firstAudio.p50 > state.budgetMs ? 'warn' : '', `p95 ${formatMs(firstAudio.p95)}`),
-    tile('Error rate', pct(s.error_rate), s.error_rate > 0.05 ? 'warn' : '', `${s.by_kind.error || 0} failed turns`),
+    tile('Turns', s.turns, '', Object.entries(s.by_channel).map(([k, v]) => `${v} ${k}`).join(' · ') || 'none yet', trend(s.turns, before.turns)),
+    tile('First audio p50', formatMs(firstAudio.p50), firstAudio.p50 > state.budgetMs ? 'warn' : '', `p95 ${formatMs(firstAudio.p95)}`,
+      trend(firstAudio.p50, before.first_audio_p50, { lowerIsBetter: true })),
+    tile('Error rate', pct(s.error_rate), s.error_rate > 0.05 ? 'warn' : '', `${s.by_kind.error || 0} failed`,
+      trend(s.error_rate, before.error_rate, { lowerIsBetter: true, points: true })),
     tile('Fallback rate', pct(s.fallback_rate), s.fallback_rate > 0.2 ? 'warn' : '', 'answered by a backup model'),
-    tile('Helpful', pct(s.feedback.helpful_rate, 0), '', `${s.feedback.rated} rated · ${s.feedback.not_helpful} down`),
-    tile('Cost', inr(s.cost_inr), '', `${(s.tokens.input + s.tokens.output).toLocaleString('en-IN')} tokens`));
+    tile('Helpful', pct(s.feedback.helpful_rate, 0), '', `${s.feedback.rated} rated`, trend(s.feedback.helpful_rate, before.helpful_rate, { points: true })),
+    tile('Cost', inr(s.cost_inr), '', `${(s.tokens.input + s.tokens.output).toLocaleString('en-IN')} tokens`, trend(s.cost_inr, before.cost_inr, { lowerIsBetter: true })));
 
   if (series.ok) {
     const points = series.data.points;
@@ -951,7 +993,7 @@ async function loadMonitoring() {
       series: [{ key: 'first_audio_p50', label: 'p50', cls: 'p50' }, { key: 'first_audio_p95', label: 'p95', cls: 'p95' }],
       empty: 'No voice turns in this period yet.',
     });
-    barChart($('chart-volume'), { points, key: 'turns', overlayKey: 'errors', format: (v) => String(Math.round(v)), xFormat: timeLabel, label: 'Turns', overlayLabel: 'Errors' });
+    barChart($('chart-volume'), { points, key: 'turns', overlayKey: 'errors', format: (v) => String(Math.round(v)), xFormat: timeLabel, label: 'Answered', overlayLabel: 'Errors' });
   }
 
   const stages = [['Speech in', 'stt_ms', 'stt'], ['Search', 'retrieval_ms', 'search'], ['Model, first token', 'first_token_ms', 'llm'], ['Speech out', 'tts_ms', 'tts']]

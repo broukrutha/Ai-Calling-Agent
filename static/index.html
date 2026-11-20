@@ -6,8 +6,9 @@
   <title>Calling Agent Console</title>
   <meta name="description" content="Operate your AI calling agent: live conversations, knowledge base, appointments, calls, monitoring and evaluation." />
   <meta name="color-scheme" content="light dark" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232952e3'/%3E%3Cpath d='M9 13v6M13 9v14M17 12v8M21 10v12M25 14v4' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
-  <link rel="preload" href="/static/fonts/inter-latin-var.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235757e2'/%3E%3Cpath d='M9 13v6M13 9v14M17 12v8M21 10v12M25 14v4' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="preload" href="/static/fonts/inter-latin-opsz.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/static/fonts/geist-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
   <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -85,12 +86,16 @@
   <div class="main" id="main">
     <header class="topbar">
       <button class="icon-btn menu-btn" type="button" data-action="open-nav" aria-label="Open navigation"><svg class="icon"><use href="#i-menu"/></svg></button>
-      <div class="topbar-title">
-        <h1 id="view-title">Overview</h1>
-        <p id="view-subtitle"></p>
+      <nav class="crumbs" aria-label="Breadcrumb">
+        <span class="crumb-root">Calling Agent</span>
+        <svg class="icon crumb-sep" aria-hidden="true"><use href="#i-chevron"/></svg>
+        <span class="crumb-page" id="crumb" aria-current="page">Overview</span>
+      </nav>
+      <div class="topbar-actions" id="topbar-actions">
+        <span class="live-chip" id="live-chip" hidden><span class="dot good"></span>Live</span>
+        <button class="icon-btn" type="button" data-action="cycle-theme" title="Switch theme" aria-label="Switch theme"><svg class="icon"><use href="#i-sun"/></svg></button>
+        <button class="icon-btn" type="button" data-action="refresh-view" title="Refresh" aria-label="Refresh"><svg class="icon"><use href="#i-refresh"/></svg></button>
       </div>
-      <div class="topbar-actions" id="topbar-actions"></div>
-      <button class="btn" type="button" data-action="refresh-view"><svg class="icon"><use href="#i-refresh"/></svg><span class="hide-sm">Refresh</span></button>
     </header>
 
     <div class="banner" id="lock-banner" hidden>
@@ -100,12 +105,16 @@
     </div>
 
     <main class="content">
+      <header class="page-head">
+        <h1 id="view-title">Overview</h1>
+        <p id="view-subtitle">How your agent is doing today.</p>
+      </header>
 
       <!-- ═══════════ Overview ═══════════ -->
       <section class="view" id="view-overview" data-title="Overview" data-subtitle="How your agent is doing today.">
         <div class="tiles">
-          <div class="tile"><div class="tile-top"><span class="tile-label">Conversations · 24 h</span><span id="spark-turns"></span></div><div class="tile-value" id="tile-turns">–</div><div class="tile-foot" id="tile-turns-foot">&nbsp;</div></div>
-          <div class="tile"><div class="tile-top"><span class="tile-label">Time to first audio · p50</span><span id="spark-latency"></span></div><div class="tile-value" id="tile-latency">–</div><div class="tile-foot" id="tile-latency-foot">&nbsp;</div></div>
+          <div class="tile"><div class="tile-top"><span class="tile-label">Conversations · 24 h</span><span id="spark-turns"></span></div><div class="tile-value" id="tile-turns">–</div><div class="tile-foot"><span class="delta" id="delta-turns" hidden></span><span id="tile-turns-foot">&nbsp;</span></div></div>
+          <div class="tile"><div class="tile-top"><span class="tile-label">Time to first audio · p50</span><span id="spark-latency"></span></div><div class="tile-value" id="tile-latency">–</div><div class="tile-foot"><span class="delta" id="delta-latency" hidden></span><span id="tile-latency-foot">&nbsp;</span></div></div>
           <div class="tile"><div class="tile-top"><span class="tile-label">Answer quality</span></div><div class="tile-value" id="tile-quality">–</div><div class="tile-foot" id="tile-quality-foot">&nbsp;</div></div>
           <div class="tile"><div class="tile-top"><span class="tile-label">Upcoming appointments</span></div><div class="tile-value" id="tile-upcoming">–</div><div class="tile-foot" id="tile-upcoming-foot">&nbsp;</div></div>
         </div>
@@ -145,7 +154,7 @@
 
             <div class="transcript" id="conversation" role="log" aria-live="polite" aria-label="Conversation">
               <div class="empty" id="chat-empty">
-                <div class="empty-orb" aria-hidden="true"><span></span><span></span><span></span></div>
+                <div class="empty-orb aurora" aria-hidden="true"><span class="aurora-glow"></span><span class="aurora-core"></span></div>
                 <p class="empty-title">Start a conversation</p>
                 <p class="empty-text">Speak or type. The agent answers from your knowledge base and can book or cancel appointments.</p>
                 <div class="suggestions">
@@ -159,8 +168,8 @@
 
             <div class="voice-dock" id="voice-dock" data-state="idle">
               <button class="orb" id="orb-btn" type="button" data-action="toggle-voice" aria-label="Start talking" aria-pressed="false">
-                <span class="orb-glow" id="orb-glow"></span>
-                <span class="orb-core"><svg class="icon icon-mic"><use href="#i-mic"/></svg><svg class="icon icon-stop"><use href="#i-stop"/></svg></span>
+                <span class="orb-glow aurora-glow" id="orb-glow"></span>
+                <span class="orb-core aurora-core"><svg class="icon icon-mic"><use href="#i-mic"/></svg><svg class="icon icon-stop"><use href="#i-stop"/></svg></span>
               </button>
               <div class="dock-text">
                 <div class="dock-state" id="dock-state">Tap to talk</div>
@@ -385,11 +394,11 @@
 
         <div class="grid-2">
           <div class="panel">
-            <div class="panel-head"><h2>Time to first audio</h2><div class="legend"><span><i class="chart-swatch p50"></i>p50</span><span><i class="chart-swatch p95"></i>p95</span></div></div>
+            <div class="panel-head"><h2>Time to first audio</h2><div class="legend"><span><i class="chart-swatch p50"></i>p50</span><span><i class="chart-swatch p95"></i>p95</span><span><i class="chart-swatch budget"></i>Budget</span></div></div>
             <div class="chart-box" id="chart-latency"></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>Conversation turns</h2><div class="legend"><span><i class="chart-swatch bar"></i>turns</span><span><i class="chart-swatch bad"></i>errors</span></div></div>
+            <div class="panel-head"><h2>Conversation turns</h2><div class="legend"><span><i class="chart-swatch bar"></i>Answered</span><span><i class="chart-swatch bad"></i>Errors</span></div></div>
             <div class="chart-box" id="chart-volume"></div>
           </div>
         </div>

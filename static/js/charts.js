@@ -20,9 +20,13 @@ function niceStep(rough) {
   return nice * exponent;
 }
 
-/** Axis from 0 to a round number at or above ``max``, with about four ticks. */
-export function niceAxis(max) {
-  const step = niceStep((max > 0 ? max : 1) / 4);
+/**
+ * Axis from 0 to a round number at or above ``max``, with about four ticks.
+ * ``integer`` keeps every tick a whole number (counts never show 2.5).
+ */
+export function niceAxis(max, { integer = false } = {}) {
+  let step = niceStep((max > 0 ? max : 1) / 4);
+  if (integer) step = step < 1 ? 1 : step === 2.5 ? 2 : step;
   const top = Math.max(step, Math.ceil((max > 0 ? max : 1) / step - 1e-9) * step);
   const ticks = [];
   for (let value = 0; value <= top + step / 2; value += step) ticks.push(Number(value.toFixed(6)));
@@ -118,7 +122,7 @@ export function lineChart(container, { points, series, format, xFormat, budget, 
       lastY = y;
     });
     root.append(svg('path', { class: `chart-line ${s.cls}`, d: path }));
-    if (path) root.append(svg('circle', { class: `chart-dot ${s.cls}`, cx: lastX, cy: lastY, r: 3.5 }));
+    if (path) root.append(svg('circle', { class: `chart-dot ${s.cls}`, cx: lastX, cy: lastY, r: 4 }));
   }
   xLabels(root, plot, points, xFormat);
   container.replaceChildren(root);
@@ -130,7 +134,16 @@ export function lineChart(container, { points, series, format, xFormat, budget, 
   ]);
 }
 
-/** Bars over time, with an optional overlaid count (errors) in a second colour. */
+/** A bar segment path: rounded data-end (top), square at the baseline. */
+function columnPath(x, y, w, h, radius) {
+  const r = Math.min(radius, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+
+/**
+ * Stacked columns over time: ``key`` is the total, ``overlayKey`` the part of it
+ * drawn on top in the critical colour (errors), separated by a 2px surface gap.
+ */
 export function barChart(container, { points, key, overlayKey, format, xFormat, label, overlayLabel }) {
   const max = Math.max(0, ...points.map((p) => p[key] || 0));
   if (!max) {
@@ -138,30 +151,43 @@ export function barChart(container, { points, key, overlayKey, format, xFormat, 
     return;
   }
   const { plot, root } = frame(container);
-  const axis = niceAxis(max);
+  const axis = niceAxis(max, { integer: true });
   yAxis(root, plot, axis, format);
   const slot = plot.w / points.length;
-  const barWidth = Math.max(Math.min(slot * 0.66, 22), 2);
+  const barWidth = Math.max(Math.min(slot * 0.68, 24), 2);
   const xOf = (i) => plot.x + slot * i + slot / 2;
+  const scale = (v) => (v / axis.top) * plot.h;
+  const GAP = 2;
   points.forEach((p, i) => {
-    const value = p[key] || 0;
-    if (!value) return;
-    const h = (value / axis.top) * plot.h;
-    root.append(svg('rect', { class: 'chart-bar', x: xOf(i) - barWidth / 2, y: plot.y + plot.h - h, width: barWidth, height: h, rx: 2 }));
-    const overlay = overlayKey ? p[overlayKey] || 0 : 0;
-    if (overlay) {
-      const oh = (overlay / axis.top) * plot.h;
-      root.append(svg('rect', { class: 'chart-bar chart-bar-bad', x: xOf(i) - barWidth / 2, y: plot.y + plot.h - oh, width: barWidth, height: oh, rx: 2 }));
+    const total = p[key] || 0;
+    if (!total) return;
+    const bad = overlayKey ? Math.min(p[overlayKey] || 0, total) : 0;
+    const good = total - bad;
+    const x = xOf(i) - barWidth / 2;
+    const baseline = plot.y + plot.h;
+    const goodH = scale(good);
+    const badH = scale(bad);
+    if (good) {
+      const top = !bad;
+      root.append(svg('path', { class: 'chart-bar', d: top ? columnPath(x, baseline - goodH, barWidth, goodH, 4) : `M${x},${baseline}V${baseline - goodH}H${x + barWidth}V${baseline}Z` }));
+    }
+    if (bad) {
+      const y = baseline - goodH - (good ? GAP : 0) - badH;
+      root.append(svg('path', { class: 'chart-bar chart-bar-bad', d: columnPath(x, y, barWidth, Math.max(badH, 1), 4) }));
     }
   });
   root.append(svg('line', { class: 'chart-axis', x1: plot.x, x2: plot.x + plot.w, y1: plot.y + plot.h, y2: plot.y + plot.h }));
-  xLabels(root, plot, points.map((p) => p), xFormat);
+  xLabels(root, plot, points, xFormat);
   container.replaceChildren(root);
-  attachTooltip(container, root, plot, points, xOf, (point) => [
-    el('div', { class: 'chart-tip-title', text: xFormat(point.t, true) }),
-    el('div', { class: 'chart-tip-row' }, el('span', { class: 'chart-swatch bar' }), el('span', { text: label }), el('strong', { text: format(point[key] || 0) })),
-    overlayKey ? el('div', { class: 'chart-tip-row' }, el('span', { class: 'chart-swatch bad' }), el('span', { text: overlayLabel }), el('strong', { text: format(point[overlayKey] || 0) })) : null,
-  ].filter(Boolean));
+  attachTooltip(container, root, plot, points, xOf, (point) => {
+    const total = point[key] || 0;
+    const bad = overlayKey ? point[overlayKey] || 0 : 0;
+    return [
+      el('div', { class: 'chart-tip-title', text: xFormat(point.t, true) }),
+      el('div', { class: 'chart-tip-row' }, el('span', { class: 'chart-swatch bar' }), el('span', { text: label }), el('strong', { text: format(total - bad) })),
+      overlayKey ? el('div', { class: 'chart-tip-row' }, el('span', { class: 'chart-swatch bad' }), el('span', { text: overlayLabel }), el('strong', { text: format(bad) })) : null,
+    ].filter(Boolean);
+  });
 }
 
 /** Tiny trend line for a tile: area fill, line and an emphasised last point. */

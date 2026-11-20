@@ -97,3 +97,18 @@ def test_old_traces_are_purged(monkeypatch):
     monkeypatch.setattr(tracing.time, "monotonic", lambda: 10_000.0)
     _turn(id="f" * 24)
     assert tracing.get_trace("e" * 24) is None and tracing.get_trace("f" * 24) is not None
+
+
+def test_summary_compares_with_the_previous_period():
+    _turn(first_audio_ms=900.0)
+    old = tracing.new_trace_id()
+    tracing.record({"id": old, "kind": "error", "channel": "phone", "first_audio_ms": 2000.0, "total_ms": 2500.0})
+    with store.connection() as conn:   # move one turn into the previous 24 hours
+        conn.execute("UPDATE traces SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 hours') WHERE id = ?", (old,))
+    summary = tracing.summary("24h")
+    assert summary["turns"] == 1
+    assert summary["previous"]["turns"] == 1
+    assert summary["previous"]["error_rate"] == 1.0
+    assert summary["previous"]["first_audio_p50"] == 2000.0
+    empty = tracing.summary("1h")["previous"]
+    assert empty["turns"] == 0 and empty["error_rate"] is None and empty["first_audio_p50"] is None
