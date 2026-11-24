@@ -280,6 +280,9 @@ kbd {
   background: var(--bg);
   border: 1px solid var(--border); border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xs);
+  /* Its own compositing layer: without it, Chromium can paint the rounded
+     corners black when the page holds blurred or masked layers. */
+  transform: translateZ(0);
 }
 
 .topbar {
