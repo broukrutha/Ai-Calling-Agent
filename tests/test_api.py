@@ -86,9 +86,17 @@ ADMIN_ROUTES = [
     ("post", "/ingest/text", {"json": {"text": "hello world", "name": "n"}}),
     ("post", "/ingest/url", {"json": {"url": "https://example.com"}}),
     ("get", "/kb/sources", {}),
+    ("get", "/kb/search?q=hours", {}),
     ("delete", "/kb/sources?source=faq.txt", {}),
     ("delete", "/kb/clear", {}),
-    ("get", "/benchmark?n=1", {}),
+    ("get", "/ops/summary", {}),
+    ("get", "/ops/timeseries", {}),
+    ("get", "/ops/traces", {}),
+    ("get", "/ops/export", {}),
+    ("post", "/evaluation/runs", {"json": {"suite": "dialog"}}),
+    ("get", "/evaluation/runs", {}),
+    ("get", "/evaluation/datasets", {}),
+    ("post", "/evaluation/generate", {"json": {"limit": 10}}),
     ("post", "/booking/create", {"json": {"date": "2026-04-06", "time": "10:00", "name": "A", "email": "a@example.com"}}),
     ("post", "/booking/cancel", {"json": {"booking_uid": "abc12345"}}),
     ("get", "/booking/list", {}),
@@ -180,6 +188,18 @@ def test_ingest_list_and_delete_sources(client):
     assert client.get("/kb/info").json()["total_chunks"] == 0
 
 
+def test_kb_search_shows_what_the_agent_would_read(client, services):
+    response = client.get("/kb/search", params={"q": "When is the office open?"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["citations"] and body["citations"][0]["source"] == "faq.txt"
+    assert body["citations"][0]["n"] == 1 and "nine to five" in body["citations"][0]["snippet"]
+    assert body["latency_ms"] >= 0
+    # The search uses the agent's own retriever, not a second index.
+    assert services.retriever is services.agent.rag.retriever
+    assert client.get("/kb/search", params={"q": ""}).status_code == 422
+
+
 def test_url_ingest_refuses_internal_addresses(client):
     response = client.post("/ingest/url", json={"url": "http://127.0.0.1:8001/booking/history"})
     assert response.status_code == 400 and "public website" in response.json()["detail"]
@@ -221,13 +241,65 @@ def test_missing_speech_key_is_a_clear_503(tmp_path):
         assert test_client.get("/booking/slots", params={"date": "2026-04-06"}).status_code == 200
 
 
-def test_benchmark_reports_latency_cost_and_accuracy(client):
-    body = client.get("/benchmark", params={"n": 3}).json()
-    assert body["successful"] == 3 and body["errors"] == 0
-    assert body["api_stack"]["llm"] == "fake/fake-1"
-    assert {"p50_ms", "p95_ms", "p99_ms"} <= set(body["latency"])
-    assert 0 <= body["accuracy"]["mean_score"] <= 1
-    assert client.get("/benchmark", params={"n": 500}).status_code == 422
+def test_answers_carry_citations_and_a_trace_id_that_can_be_rated(client):
+    body = client.post("/query", json={"query": "What are your office hours?"}).json()
+    assert body["citations"][0]["source"] == "faq.txt" and "nine to five" in body["citations"][0]["snippet"]
+    trace_id = body["trace_id"]
+
+    assert client.post("/feedback", json={"trace_id": trace_id, "rating": -1, "comment": "too vague"}).status_code == 200
+    assert client.post("/feedback", json={"trace_id": "0" * 24, "rating": 1}).status_code == 404
+    assert client.post("/feedback", json={"trace_id": trace_id, "rating": 5}).status_code == 422
+    assert client.post("/feedback", json={"trace_id": "../etc", "rating": 1}).status_code == 422
+
+    trace = client.get(f"/ops/traces/{trace_id}").json()
+    assert (trace["kind"], trace["channel"], trace["rating"], trace["comment"]) == ("answer", "api", -1, "too vague")
+    assert trace["passages"][0]["source"] == "faq.txt" and trace["provider"] == "fake"
+
+    summary = client.get("/ops/summary", params={"window": "24h"}).json()
+    assert summary["turns"] == 1 and summary["feedback"]["not_helpful"] == 1
+    assert summary["latency_ms"]["total_ms"]["count"] == 1
+
+    export = client.get("/ops/export").text.strip().splitlines()
+    assert len(export) == 1 and '"answer_given"' in export[0]
+    assert client.get("/ops/timeseries", params={"window": "7d"}).json()["points"]
+    assert client.get("/ops/summary", params={"window": "1y"}).status_code == 422
+
+
+def test_evaluation_runs_in_the_background_and_is_stored(services, client):
+    import time
+
+    services.eval_embedding_function = HashingEmbedder()
+    datasets = client.get("/evaluation/datasets").json()
+    assert datasets["golden"]["cases"] >= 60 and datasets["generated"]["available"] is False
+
+    started = client.post("/evaluation/runs", json={"suite": "dialog"})
+    assert started.status_code == 202
+    run_id = started.json()["id"]
+    for _ in range(100):
+        run = client.get(f"/evaluation/runs/{run_id}").json()
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "completed", run.get("error")
+    [suite] = run["suites"]
+    assert suite["suite"] == "dialog" and suite["gates_passed"] and suite["headline"]["success_rate"] == 1.0
+    assert client.get("/evaluation/runs").json()["runs"][0]["id"] == run_id
+    assert store.get_bookings() == []                       # evaluation never touches real bookings
+
+    live = client.post("/evaluation/runs", json={"suite": "retrieval", "kb": "live"}).json()["id"]
+    for _ in range(100):
+        run = client.get(f"/evaluation/runs/{live}").json()
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "failed" and "Generate questions" in run["error"]
+    assert client.post("/evaluation/runs", json={"suite": "nonsense"}).status_code == 422
+
+    # A run that has not finished its first suite reports empty lists, not an object.
+    with store.connection() as conn:
+        conn.execute("INSERT INTO eval_runs (id, suite, dataset) VALUES ('pending01', 'all', 'sample/golden')")
+    pending = client.get("/evaluation/runs/pending01").json()
+    assert pending["status"] == "running" and pending["results"] == [] and pending["suites"] == []
 
 
 # ── Booking ──────────────────────────────────────────────────────────────────
@@ -320,6 +392,7 @@ def test_ws_voice_turn_streams_events_in_order(client, provider):
         events = _until(ws, "done", "error")
         kinds = [e["type"] for e in events]
         assert kinds[:2] == ["processing", "transcript"] and kinds[-1] == "done"
+        assert events[-1]["trace_id"] and events[-1]["citations"][0]["source"] == "faq.txt"
         audio = [base64.b64decode(e["audio"]) for e in events if e["type"] == "audio_chunk"]
         assert audio == [b"AUDIO<Our office is open nine to five.>", b"AUDIO<Visit any weekday.>"]
         assert events[-1]["answer"] == provider.answer
@@ -328,13 +401,13 @@ def test_ws_voice_turn_streams_events_in_order(client, provider):
 def test_ws_text_and_voice_share_one_booking_conversation(client, provider):
     with client.websocket_connect("/ws/voice") as ws:
         ws.send_json({"type": "query", "query": "book an appointment tomorrow at 2 pm"})
-        assert "May I have your name" in ws.receive_json()["answer"]
+        assert "May I have your name" in _until(ws, "text_result")[-1]["answer"]
 
         ws.send_json(_audio_message(provider, "Rahul Sharma"))
         assert "email" in _until(ws, "done")[-1]["answer"]
 
         ws.send_json({"type": "query", "query": "rahul@gmail.com"})
-        assert "Shall I book it" in ws.receive_json()["answer"]
+        assert "Shall I book it" in _until(ws, "text_result")[-1]["answer"]
 
         ws.send_json(_audio_message(provider, "Yes"))
         done = _until(ws, "done")[-1]
@@ -393,6 +466,23 @@ def test_ws_rate_limit(client, provider, monkeypatch):
     with client.websocket_connect("/ws/voice") as ws:
         for _ in range(2):
             ws.send_json({"type": "query", "query": "What are your office hours?"})
-            assert ws.receive_json()["type"] == "text_result"
+            assert _until(ws, "text_result")[-1]["type"] == "text_result"
         ws.send_json({"type": "query", "query": "What are your office hours?"})
         assert "too quickly" in ws.receive_json()["message"]
+
+
+def test_ws_new_utterance_interrupts_the_answer_in_progress(client, provider):
+    import asyncio
+
+    provider.answer = "First sentence that is slow to say. Second sentence follows here."
+    provider.tts_delays = {"First sentence that is slow to say.": 0.5}
+    with client.websocket_connect("/ws/voice") as ws:
+        ws.send_json(_audio_message(provider, "Tell me something long"))
+        assert _until(ws, "transcript")[-1]["text"] == "Tell me something long"
+        ws.send_json({"type": "cancel"})
+        provider.answer = "Short."
+        ws.send_json({"type": "query", "query": "Quick one"})
+        events = _until(ws, "text_result")
+        assert not any(e["type"] == "done" for e in events)     # the interrupted turn never finished
+        assert events[-1]["answer"] == "Short."
+    assert asyncio.iscoroutinefunction(provider.synthesize)

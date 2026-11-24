@@ -5,10 +5,11 @@ Client → server
     {"type": "ping"}
     {"type": "query", "query": "...", "language": "en-IN"}
     {"type": "audio", "data": "<base64>", "format": "webm", "language": "unknown", "duration_ms": 2300}
+    {"type": "cancel"}                                      stop the turn in progress (barge-in)
 
 Server → client
     {"type": "pong", "ready": true}
-    {"type": "processing"}
+    {"type": "processing"}                                  a new turn has started
     {"type": "transcript",  "text": "..."}
     {"type": "noise",       "message": "..."}
     {"type": "text_chunk",  "text": "..."}
@@ -18,12 +19,18 @@ Server → client
     {"type": "error",       "message": "..."}
 
 Each connection has its own conversation memory and booking state.
+
+Turns run in a task beside the receive loop, so the caller can interrupt: a
+``cancel`` message, or a new utterance arriving mid-answer, stops the current
+turn at once instead of paying for the rest of an answer nobody will hear.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import re
@@ -66,7 +73,16 @@ async def voice_websocket(websocket: WebSocket) -> None:
     request_id_var.set(f"ws-{uuid.uuid4().hex[:8]}")
     services = get_services_ws(websocket)
     session = ConversationSession()
+    current: asyncio.Task | None = None
     logger.info("WebSocket connected")
+
+    async def stop_current() -> None:
+        nonlocal current
+        if current is not None and not current.done():
+            current.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await current
+        current = None
 
     try:
         while True:
@@ -86,6 +102,9 @@ async def voice_websocket(websocket: WebSocket) -> None:
             if kind == "ping":
                 await _send(websocket, type="pong", ready=services.agent_ready)
                 continue
+            if kind == "cancel":
+                await stop_current()
+                continue
             if kind not in ("query", "audio"):
                 await _error(websocket, "Unknown message type.")
                 continue
@@ -94,28 +113,42 @@ async def voice_websocket(websocket: WebSocket) -> None:
                 await _error(websocket, "You're sending requests too quickly. Please wait a moment.")
                 continue
 
-            try:
-                agent = services.agent
-                if kind == "query":
-                    await _handle_query(websocket, agent, session, message)
-                else:
-                    await _handle_audio(websocket, agent, session, message)
-            except AgentUnavailableError as exc:
-                await _error(websocket, str(exc))
-            except LLMUnavailableError:
-                logger.exception("LLM unavailable")
-                await _error(websocket, "The assistant is temporarily unavailable. Please try again shortly.")
-            except ProviderError:
-                logger.exception("Speech provider error")
-                await _error(websocket, "The speech service is temporarily unavailable. Please try again shortly.")
-            except WebSocketDisconnect:
-                raise
-            except Exception:
-                logger.exception("Unhandled error in voice WebSocket")
-                await _error(websocket, "Something went wrong on our side. Please try again.")
+            await stop_current()          # a new turn interrupts the previous one
+            current = asyncio.create_task(_run_turn(websocket, services, session, kind, message))
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
+    finally:
+        await stop_current()
+
+
+async def _run_turn(websocket: WebSocket, services, session: ConversationSession, kind: str, message: dict) -> None:
+    try:
+        agent = services.agent
+        if kind == "query":
+            await _handle_query(websocket, agent, session, message)
+        else:
+            await _handle_audio(websocket, agent, session, message)
+    except asyncio.CancelledError:
+        raise
+    except AgentUnavailableError as exc:
+        await _safe_error(websocket, str(exc))
+    except LLMUnavailableError:
+        logger.exception("LLM unavailable")
+        await _safe_error(websocket, "The assistant is temporarily unavailable. Please try again shortly.")
+    except ProviderError:
+        logger.exception("Speech provider error")
+        await _safe_error(websocket, "The speech service is temporarily unavailable. Please try again shortly.")
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Unhandled error in voice WebSocket")
+        await _safe_error(websocket, "Something went wrong on our side. Please try again.")
+
+
+async def _safe_error(websocket: WebSocket, message: str) -> None:
+    with contextlib.suppress(Exception):
+        await _error(websocket, message)
 
 
 async def _handle_query(websocket: WebSocket, agent, session: ConversationSession, message: dict) -> None:
@@ -127,6 +160,7 @@ async def _handle_query(websocket: WebSocket, agent, session: ConversationSessio
         await _error(websocket, f"Questions are limited to {config.MAX_QUERY_CHARS} characters.")
         return
     language = str(message.get("language") or "en-IN")
+    await _send(websocket, type="processing")
     result = await agent.query_text(
         query, session=session, language=language if _LANGUAGE_RE.match(language) else "en-IN"
     )

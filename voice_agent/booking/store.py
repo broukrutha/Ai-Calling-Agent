@@ -1,5 +1,5 @@
 """
-SQLite persistence for bookings and phone-call records.
+SQLite persistence: bookings, phone calls, conversation traces and eval runs.
 
 One small database file holds everything the dashboard needs to show. The
 schema is created (and migrated) on first use, so there is nothing to set up.
@@ -10,6 +10,7 @@ the telephony worker (a separate process) share the same file safely.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import secrets
@@ -25,6 +26,9 @@ from voice_agent.logging_config import mask_email, mask_phone
 logger = logging.getLogger(__name__)
 
 _local = threading.local()
+# Lets one task (an evaluation run) use its own database without touching the
+# path every other request uses.
+_path_override: contextvars.ContextVar[str | None] = contextvars.ContextVar("db_path_override", default=None)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bookings (
@@ -65,6 +69,51 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_calls_created ON calls(created_at);
+
+CREATE TABLE IF NOT EXISTS traces (
+    id               TEXT    PRIMARY KEY,
+    created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    channel          TEXT    NOT NULL,                 -- voice | chat | api | phone
+    session_id       TEXT    NOT NULL DEFAULT '',
+    kind             TEXT    NOT NULL,                 -- answer | booking | noise | error
+    question         TEXT    NOT NULL DEFAULT '',
+    retrieval_query  TEXT    NOT NULL DEFAULT '',
+    answer           TEXT    NOT NULL DEFAULT '',
+    language         TEXT    NOT NULL DEFAULT '',
+    provider         TEXT    NOT NULL DEFAULT '',
+    model            TEXT    NOT NULL DEFAULT '',
+    prompt_version   TEXT    NOT NULL DEFAULT '',
+    cached           INTEGER NOT NULL DEFAULT 0,
+    followup         INTEGER NOT NULL DEFAULT 0,
+    fallback         INTEGER NOT NULL DEFAULT 0,       -- answered by a backup provider
+    passage_count    INTEGER NOT NULL DEFAULT 0,
+    top_score        REAL,
+    passages         TEXT    NOT NULL DEFAULT '[]',    -- JSON: source, section, score
+    stt_ms           REAL, retrieval_ms REAL, llm_ms REAL, first_token_ms REAL,
+    tts_ms           REAL, first_audio_ms REAL, total_ms REAL,
+    input_tokens     INTEGER NOT NULL DEFAULT 0,
+    output_tokens    INTEGER NOT NULL DEFAULT 0,
+    cost_inr         REAL    NOT NULL DEFAULT 0,
+    error            TEXT    NOT NULL DEFAULT '',
+    rating           INTEGER,                          -- 1 helpful, -1 not helpful
+    comment          TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at);
+CREATE INDEX IF NOT EXISTS idx_traces_rating  ON traces(rating);
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id           TEXT    PRIMARY KEY,
+    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    finished_at  TEXT,
+    suite        TEXT    NOT NULL,
+    dataset      TEXT    NOT NULL DEFAULT '',
+    status       TEXT    NOT NULL DEFAULT 'running',  -- running | completed | failed
+    summary      TEXT    NOT NULL DEFAULT '{}',       -- JSON
+    error        TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_runs_created ON eval_runs(created_at);
 """
 
 # Columns added after the first release: (table, column, DDL).
@@ -74,7 +123,17 @@ _MIGRATIONS = [
 
 
 def _db_path() -> str:
-    return os.path.abspath(config.BOOKINGS_DB_PATH)
+    return os.path.abspath(_path_override.get() or config.BOOKINGS_DB_PATH)
+
+
+@contextmanager
+def use_database(path: str) -> Iterator[None]:
+    """Route this task's (and its threads') database access to ``path``."""
+    token = _path_override.set(path)
+    try:
+        yield
+    finally:
+        _path_override.reset(token)
 
 
 def _today() -> str:
@@ -116,6 +175,10 @@ def _get_conn() -> Iterator[sqlite3.Connection]:
     except Exception:
         conn.rollback()
         raise
+
+
+# Public name for the other modules that share this database.
+connection = _get_conn
 
 
 def close() -> None:

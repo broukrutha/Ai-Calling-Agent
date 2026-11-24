@@ -24,7 +24,10 @@ class Services:
     def __init__(self, vector_store: VectorStore | None = None, agent: VoiceAgent | None = None) -> None:
         self._vector_store = vector_store
         self._agent = agent
+        self._retriever = None
         self._lock = threading.Lock()
+        # Embedding function for evaluation indexes; None uses the configured model.
+        self.eval_embedding_function = None
 
     @property
     def vector_store(self) -> VectorStore:
@@ -32,6 +35,21 @@ class Services:
             if self._vector_store is None:
                 self._vector_store = self._agent.rag.vs if self._agent is not None else VectorStore()
             return self._vector_store
+
+    @property
+    def retriever(self):
+        """The agent's own hybrid retriever, so searches here match what callers get."""
+        from voice_agent.rag_pipeline import HybridRetriever
+
+        rag = getattr(self._agent, "rag", None)
+        own = getattr(rag, "retriever", None)
+        if isinstance(own, HybridRetriever):
+            return own
+        store = self.vector_store
+        with self._lock:
+            if self._retriever is None or self._retriever.vs is not store:
+                self._retriever = HybridRetriever(store)
+            return self._retriever
 
     @property
     def agent(self) -> VoiceAgent:

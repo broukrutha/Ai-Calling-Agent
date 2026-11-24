@@ -7,7 +7,10 @@ Provider client: Sarvam AI speech (STT + TTS) and a multi-provider LLM.
   first audio can be played while the rest is still being generated.
 * **LLM** – OpenAI-compatible chat completions with an ordered fallback chain
   (OpenAI → Groq → Sarvam, starting from ``LLM_PROVIDER``). A rate limit or
-  outage on one provider moves to the next instead of failing the call.
+  outage on one provider moves to the next instead of failing the call, and a
+  per-provider circuit breaker benches a provider that keeps failing (a
+  rejected key, an exhausted quota, a retired model) so later turns do not pay
+  for the failed attempt again.
 
 A single pooled ``httpx.AsyncClient`` is shared by every request.
 """
@@ -36,7 +39,6 @@ LANGUAGE_NAMES = {
     "mr-IN": "Marathi", "pa-IN": "Punjabi", "od-IN": "Odia",
 }
 _AUDIO_FORMATS = ("wav", "mp3", "webm", "ogg", "mp4", "flac")
-_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 # Older REST model, tried automatically if the configured one is refused.
 _STT_FALLBACK_MODEL = "saarika:v2.5"
 
@@ -65,6 +67,8 @@ class LLMResult:
     output_tokens: int
     latency_ms: float
     provider: str = ""
+    model: str = ""
+    fallback: bool = False          # answered by a provider other than the first choice
 
 
 @dataclass
@@ -79,6 +83,8 @@ class LLMStreamStats:
     """Filled in while a stream runs, so the caller can report usage afterwards."""
 
     provider: str = ""
+    model: str = ""
+    fallback: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     first_token_ms: float = 0.0
@@ -92,6 +98,69 @@ class LLMProvider:
     model: str
     headers: dict[str, str] = field(repr=False)
     extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+# ── Circuit breaker ──────────────────────────────────────────────────────────
+
+class CircuitBreaker:
+    """
+    Remembers which providers are failing and for how long to skip them.
+
+    Failures that will not fix themselves within seconds (rejected key,
+    exhausted quota, unknown model) bench the provider for ten minutes. Rate
+    limits bench it for the time the provider asks, transient errors only after
+    they repeat.
+    """
+
+    LONG = 600.0
+    SHORT = 30.0
+
+    def __init__(self) -> None:
+        self._open_until: dict[str, float] = {}
+        self._reason: dict[str, str] = {}
+        self._consecutive: dict[str, int] = {}
+
+    def available(self, name: str) -> bool:
+        return time.monotonic() >= self._open_until.get(name, 0.0)
+
+    def success(self, name: str) -> None:
+        self._open_until.pop(name, None)
+        self._reason.pop(name, None)
+        self._consecutive[name] = 0
+
+    def failure(self, name: str, status: int | None = None, body: str = "", retry_after: str = "") -> None:
+        lowered = body.lower()
+        self._consecutive[name] = self._consecutive.get(name, 0) + 1
+        if status in (401, 403):
+            self._open(name, self.LONG, "API key rejected")
+        elif status == 429 and ("quota" in lowered or "billing" in lowered or "credit" in lowered):
+            self._open(name, self.LONG, "quota exhausted")
+        elif status == 429:
+            wait = float(retry_after) if retry_after.replace(".", "", 1).isdigit() else 20.0
+            self._open(name, min(max(wait, 5.0), 120.0), "rate limited")
+        elif status == 404:
+            self._open(name, self.LONG, "model not found")
+        elif status == 400:
+            self._open(name, 60.0, "request rejected")
+        elif self._consecutive[name] >= 2:
+            self._open(name, self.SHORT, "unreachable" if status is None else f"HTTP {status}")
+
+    def _open(self, name: str, seconds: float, reason: str) -> None:
+        self._open_until[name] = time.monotonic() + seconds
+        self._reason[name] = reason
+        logger.warning("LLM provider %s benched for %.0f s: %s", name, seconds, reason)
+
+    def state(self, name: str) -> dict[str, Any]:
+        remaining = self._open_until.get(name, 0.0) - time.monotonic()
+        if remaining <= 0:
+            return {"state": "closed"}
+        return {"state": "open", "reason": self._reason.get(name, ""), "retry_in_sec": round(remaining)}
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Models that think before answering and take different request parameters."""
+    name = model.lower().rsplit("/", 1)[-1]
+    return name.startswith(("gpt-oss", "o1", "o3", "o4", "gpt-5"))
 
 
 # ── <think> filtering ────────────────────────────────────────────────────────
@@ -226,6 +295,7 @@ class SarvamClient:
             trust_env=config.HTTP_TRUST_ENV,
         )
         self.providers = build_provider_chain()
+        self.breaker = CircuitBreaker()
         self._stt_models = list(dict.fromkeys([config.STT_MODEL, _STT_FALLBACK_MODEL]))
         self._tts_semaphore = asyncio.Semaphore(config.TTS_MAX_CONCURRENCY)
         self._health_cache: tuple[float, dict[str, Any]] | None = None
@@ -300,18 +370,89 @@ class SarvamClient:
     # ── LLM ──────────────────────────────────────────────────────────────────
 
     def _payload(self, provider: LLMProvider, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": provider.model,
-            "messages": messages,
-            "max_tokens": config.LLM_MAX_TOKENS,
-            "temperature": config.LLM_TEMPERATURE,
-            **provider.extra_body,
-        }
+        payload: dict[str, Any] = {"model": provider.model, "messages": messages, **provider.extra_body}
+        if is_reasoning_model(provider.model):
+            # Reasoning tokens count against the limit, so allow room for them and
+            # keep the thinking short: this is a live conversation.
+            payload["max_completion_tokens"] = max(config.LLM_MAX_TOKENS, 1024)
+            payload["reasoning_effort"] = config.LLM_REASONING_EFFORT
+            if provider.name != "openai":
+                payload["temperature"] = config.LLM_TEMPERATURE
+        else:
+            payload["max_tokens"] = config.LLM_MAX_TOKENS
+            payload["temperature"] = config.LLM_TEMPERATURE
         if stream:
             payload["stream"] = True
             if provider.name == "openai":
                 payload["stream_options"] = {"include_usage": True}
         return payload
+
+    def _ordered_providers(self) -> list[LLMProvider]:
+        """Healthy providers in preference order; benched ones only as a last resort."""
+        healthy = [p for p in self.providers if self.breaker.available(p.name)]
+        return healthy or list(self.providers)
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> LLMResult:
+        """
+        One chat completion for arbitrary messages, through the provider chain.
+        Used directly by the evaluation judge; ``generate`` builds RAG messages.
+        """
+        last_error = "no LLM provider is configured"
+        preferred = self.providers[0].name if self.providers else ""
+
+        for provider in self._ordered_providers():
+            payload = self._payload(provider, messages, stream=False)
+            if max_tokens is not None:
+                payload["max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"] = max_tokens
+            if temperature is not None and "temperature" in payload:
+                payload["temperature"] = temperature
+            for attempt in range(2):
+                started = time.perf_counter()
+                try:
+                    resp = await self._client.post(provider.url, json=payload, headers=provider.headers)
+                except httpx.HTTPError as exc:
+                    last_error = f"{provider.name}: {type(exc).__name__}"
+                    logger.warning("LLM %s request error: %s", provider.name, exc)
+                    self.breaker.failure(provider.name)
+                    break
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw = (data["choices"][0]["message"].get("content") or "").strip()
+                    answer = strip_think(raw) or raw
+                    if not answer:
+                        last_error = f"{provider.name}: empty response"
+                        self.breaker.failure(provider.name, status=None)
+                        break
+                    usage = data.get("usage") or {}
+                    elapsed = (time.perf_counter() - started) * 1000
+                    self.breaker.success(provider.name)
+                    logger.info("LLM %s/%s | %.0f ms", provider.name, provider.model, elapsed)
+                    return LLMResult(
+                        answer=answer,
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        latency_ms=round(elapsed, 2),
+                        provider=provider.name,
+                        model=provider.model,
+                        fallback=provider.name != preferred,
+                    )
+
+                body = resp.text[:300]
+                last_error = f"{provider.name}: HTTP {resp.status_code}"
+                logger.warning("LLM %s returned %s: %s", provider.name, resp.status_code, body)
+                if resp.status_code in (500, 502, 503, 504) and attempt == 0:
+                    await asyncio.sleep(0.4)
+                    continue
+                self.breaker.failure(provider.name, resp.status_code, body, resp.headers.get("retry-after", ""))
+                break
+
+        raise LLMUnavailableError(f"All LLM providers failed ({last_error}).")
 
     async def generate(
         self,
@@ -321,44 +462,8 @@ class SarvamClient:
         history: list[dict[str, str]] | None = None,
         language: str = "en-IN",
     ) -> LLMResult:
-        """One complete answer. Falls through the provider chain on failure."""
-        messages = build_messages(user_message, context, history, language, system_prompt)
-        last_error = "no LLM provider is configured"
-
-        for provider in self.providers:
-            for attempt in range(2):
-                started = time.perf_counter()
-                try:
-                    resp = await self._client.post(
-                        provider.url, json=self._payload(provider, messages, stream=False), headers=provider.headers
-                    )
-                except httpx.HTTPError as exc:
-                    last_error = f"{provider.name}: {type(exc).__name__}"
-                    logger.warning("LLM %s request error: %s", provider.name, exc)
-                    break
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw = (data["choices"][0]["message"].get("content") or "").strip()
-                    usage = data.get("usage") or {}
-                    elapsed = (time.perf_counter() - started) * 1000
-                    logger.info("LLM %s/%s | %.0f ms", provider.name, provider.model, elapsed)
-                    return LLMResult(
-                        answer=strip_think(raw) or raw,
-                        input_tokens=usage.get("prompt_tokens", 0),
-                        output_tokens=usage.get("completion_tokens", 0),
-                        latency_ms=round(elapsed, 2),
-                        provider=provider.name,
-                    )
-
-                last_error = f"{provider.name}: HTTP {resp.status_code}"
-                logger.warning("LLM %s returned %s: %s", provider.name, resp.status_code, resp.text[:300])
-                if resp.status_code in _RETRYABLE_STATUS and attempt == 0:
-                    await asyncio.sleep(0.5)
-                    continue
-                break
-
-        raise LLMUnavailableError(f"All LLM providers failed ({last_error}).")
+        """One complete grounded answer. Falls through the provider chain on failure."""
+        return await self.complete(build_messages(user_message, context, history, language, system_prompt))
 
     async def generate_stream(
         self,
@@ -372,29 +477,35 @@ class SarvamClient:
         """
         Yield the answer token by token.
 
-        Providers are tried in order until one starts streaming. Once text has
+        Providers are tried in order until one starts streaming. A provider that
+        goes silent for ``LLM_STALL_TIMEOUT_SEC`` is abandoned. Once text has
         been yielded the stream is committed to that provider: a mid-stream
         failure ends the answer early rather than restarting it in another voice.
         """
         messages = build_messages(user_message, context, history, language, system_prompt)
         stats = stats if stats is not None else LLMStreamStats()
         last_error = "no LLM provider is configured"
+        preferred = self.providers[0].name if self.providers else ""
         started = time.perf_counter()
+        timeout = httpx.Timeout(config.LLM_TIMEOUT_SEC, connect=5.0, read=config.LLM_STALL_TIMEOUT_SEC)
 
-        for provider in self.providers:
+        for provider in self._ordered_providers():
             think = ThinkTagFilter()
             yielded = False
             try:
                 async with self._client.stream(
-                    "POST", provider.url, json=self._payload(provider, messages, stream=True), headers=provider.headers
+                    "POST", provider.url, json=self._payload(provider, messages, stream=True),
+                    headers=provider.headers, timeout=timeout,
                 ) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", "replace")[:300]
                         last_error = f"{provider.name}: HTTP {resp.status_code}"
                         logger.warning("LLM %s stream returned %s: %s", provider.name, resp.status_code, body)
+                        self.breaker.failure(provider.name, resp.status_code, body, resp.headers.get("retry-after", ""))
                         continue
 
-                    stats.provider = provider.name
+                    stats.provider, stats.model = provider.name, provider.model
+                    stats.fallback = provider.name != preferred
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -427,14 +538,17 @@ class SarvamClient:
             except httpx.HTTPError as exc:
                 last_error = f"{provider.name}: {type(exc).__name__}"
                 logger.warning("LLM %s stream error: %s", provider.name, exc)
+                self.breaker.failure(provider.name)
                 if not yielded:
                     continue
 
             if yielded:
+                self.breaker.success(provider.name)
                 stats.total_ms = round((time.perf_counter() - started) * 1000, 2)
                 logger.info("LLM stream %s/%s | %.0f ms", provider.name, provider.model, stats.total_ms)
                 return
             last_error = f"{provider.name}: empty response"
+            self.breaker.failure(provider.name)
 
         raise LLMUnavailableError(f"All LLM providers failed ({last_error}).")
 
@@ -519,6 +633,9 @@ class SarvamClient:
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "fallback_providers": [p.name for p in self.providers[1:]],
+            "providers": [
+                {"name": p.name, "model": p.model, **self.breaker.state(p.name)} for p in self.providers
+            ],
             "stt_model": self._stt_models[0],
             "tts_model": config.TTS_MODEL,
         }

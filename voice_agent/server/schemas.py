@@ -61,3 +61,25 @@ class BookingCancelRequest(BaseModel):
 
 class OutboundCallRequest(BaseModel):
     phone_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$", description="E.164, e.g. +919988776655")
+
+
+class FeedbackRequest(BaseModel):
+    trace_id: str = Field(pattern=r"^[0-9a-f]{8,64}$")
+    rating: int = Field(description="1 helpful, -1 not helpful")
+    comment: str = Field(default="", max_length=500)
+
+    @field_validator("rating")
+    @classmethod
+    def _rating(cls, value: int) -> int:
+        if value not in (1, -1):
+            raise ValueError("rating must be 1 or -1")
+        return value
+
+
+class EvalRunRequest(BaseModel):
+    suite: str = Field(default="retrieval", pattern="^(retrieval|dialog|answers|all)$")
+    kb: str = Field(default="sample", pattern="^(sample|live)$")
+
+
+class GenerateRequest(BaseModel):
+    limit: int = Field(default=30, ge=5, le=100)

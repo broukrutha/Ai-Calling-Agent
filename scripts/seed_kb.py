@@ -1,11 +1,11 @@
 """
 Load documents into the knowledge base from the command line.
 
-    python scripts/seed_kb.py sample_doc/knowledge_base.txt
+    python scripts/seed_kb.py sample_doc/knowledge_base.txt sample_doc/clinic_faq.md
     python scripts/seed_kb.py brochure.pdf https://example.com/faq
 
 Useful for first-time setup and for seeding a container. Re-running with the
-same file updates it in place rather than duplicating it.
+same file replaces its previous passages, so it also applies chunking changes.
 """
 
 import argparse
@@ -21,7 +21,7 @@ from voice_agent.vector_store import VectorStore  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Add files or web pages to the knowledge base.")
-    parser.add_argument("sources", nargs="+", help="paths to .pdf / .txt files, or http(s) URLs")
+    parser.add_argument("sources", nargs="+", help="paths to .pdf / .txt / .md files, or http(s) URLs")
     args = parser.parse_args()
 
     configure_logging()
@@ -33,6 +33,8 @@ def main() -> int:
     failed = 0
     for source in args.sources:
         kind = "url" if source.startswith(("http://", "https://")) else "file"
+        if kind == "file":
+            source = str(Path(source))
         try:
             chunks = store.add_documents(ingest(source, kind))
         except IngestError as exc:

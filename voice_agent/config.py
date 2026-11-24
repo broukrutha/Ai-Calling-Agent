@@ -147,6 +147,12 @@ SARVAM_LLM_MODEL: str = _env_str("SARVAM_LLM_MODEL", "sarvam-m")
 LLM_MAX_TOKENS: int = _env_int("LLM_MAX_TOKENS", 512)
 LLM_TEMPERATURE: float = _env_float("LLM_TEMPERATURE", 0.2)
 LLM_TIMEOUT_SEC: float = _env_float("LLM_TIMEOUT_SEC", 30.0)
+# A streaming answer that goes silent this long is abandoned for the next provider.
+LLM_STALL_TIMEOUT_SEC: float = _env_float("LLM_STALL_TIMEOUT_SEC", 8.0)
+# Thinking budget for reasoning models (gpt-oss, o-series): low | medium | high.
+LLM_REASONING_EFFORT: str = _env_str("LLM_REASONING_EFFORT", "low")
+# Recorded with every trace, so answer quality can be compared across prompt changes.
+PROMPT_VERSION: str = "2026-11-19"
 # Turns of conversation (user + assistant messages) sent back to the LLM.
 CONVERSATION_HISTORY_MESSAGES: int = _env_int("CONVERSATION_HISTORY_MESSAGES", 6)
 
@@ -159,28 +165,51 @@ LLM_SYSTEM_PROMPT: str = (
     "Never read out raw dates or timestamps such as 2026-04-03T15:00:00; say 'April 3rd at 3 PM'. "
     "Do not think aloud and do not use <think> tags. "
     "Keep answers to one or two sentences unless the user asks for more detail. "
-    "Reply in the language named in the [Reply language: ...] line of the user's message."
+    "Reply in the language named in the [Reply language: ...] line of the user's message. "
+    "Passages are numbered like [1]; use them, but never read the numbers or source names aloud."
 )
 
 # ── Latency budget (milliseconds) ────────────────────────────────────────────
 LATENCY_TARGET_TOTAL_MS: int = _env_int("LATENCY_TARGET_TOTAL_MS", 3000)
+# Speak the first clause as soon as it is this long instead of waiting for the
+# whole first sentence (0 waits for full sentences).
+FIRST_CHUNK_MIN_CHARS: int = _env_int("FIRST_CHUNK_MIN_CHARS", 40)
 
 # ── RAG / ChromaDB ───────────────────────────────────────────────────────────
 CHROMA_PERSIST_DIR: str = _env_str("CHROMA_PERSIST_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME: str = _env_str("CHROMA_COLLECTION_NAME", "voice_agent_kb")
-EMBEDDING_MODEL: str = _env_str("EMBEDDING_MODEL", "paraphrase-MiniLM-L3-v2")
+# Changing the model requires rebuilding the index: python scripts/reindex_kb.py
+EMBEDDING_MODEL: str = _env_str("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-CHUNK_SIZE: int = _env_int("CHUNK_SIZE", 512)
-CHUNK_OVERLAP: int = _env_int("CHUNK_OVERLAP", 50)
-TOP_K_RETRIEVAL: int = _env_int("TOP_K_RETRIEVAL", 2)
+# Chunks are packed from whole paragraphs and list items up to this many characters.
+CHUNK_SIZE: int = _env_int("CHUNK_SIZE", 600)
+CHUNK_OVERLAP: int = _env_int("CHUNK_OVERLAP", 80)       # only when one paragraph exceeds a chunk
+# "hybrid" (embeddings + BM25 keywords) or "dense" (embeddings only).
+RETRIEVAL_MODE: str = _env_str("RETRIEVAL_MODE", "hybrid").lower()
+TOP_K_RETRIEVAL: int = _env_int("TOP_K_RETRIEVAL", 3)    # passages handed to the LLM
+RETRIEVAL_CANDIDATES: int = _env_int("RETRIEVAL_CANDIDATES", 20)  # depth of each ranking before fusion
+# Bonus, in cosine-similarity units, for a passage matching all of the question's
+# informative words. 0 turns keyword search off.
+LEXICAL_WEIGHT: float = _env_float("LEXICAL_WEIGHT", 0.2)
 MIN_RELEVANCE_SCORE: float = _env_float("MIN_RELEVANCE_SCORE", 0.15)
-# Cross-encoder reranking is more accurate but adds 50–200 ms per query.
+# Drop passages scoring more than this far below the best passage (cosine units).
+RELEVANCE_MARGIN: float = _env_float("RELEVANCE_MARGIN", 0.15)
+# Cross-encoder reranking is more accurate but adds 50–200 ms per query on CPU.
 ENABLE_RERANKER: bool = _env_bool("ENABLE_RERANKER", False)
+RERANK_CANDIDATES: int = _env_int("RERANK_CANDIDATES", 10)
 RERANKER_MODEL: str = _env_str("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # ── Answer cache ─────────────────────────────────────────────────────────────
 ENABLE_ANSWER_CACHE: bool = _env_bool("ENABLE_ANSWER_CACHE", True)
 CACHE_MAX_SIZE: int = _env_int("CACHE_MAX_SIZE", 200)
+
+# ── Observability ────────────────────────────────────────────────────────────
+TRACING_ENABLED: bool = _env_bool("TRACING_ENABLED", True)
+# Store question and answer text in traces (emails and phone numbers are masked).
+TRACE_STORE_TEXT: bool = _env_bool("TRACE_STORE_TEXT", True)
+TRACE_RETENTION_DAYS: int = _env_int("TRACE_RETENTION_DAYS", 30)
+# Where generated evaluation datasets are written.
+EVAL_DATA_DIR: str = _env_str("EVAL_DATA_DIR", "./data/eval")
 
 # ── Cost model (INR) ─────────────────────────────────────────────────────────
 COST_STT_PER_HOUR_INR: float = _env_float("COST_STT_PER_HOUR_INR", 30.0)
@@ -253,6 +282,8 @@ def validate() -> list[str]:
         errors.append("OFFICE_START_HOUR must be lower than OFFICE_END_HOUR (both 0–24).")
     if CHUNK_OVERLAP >= CHUNK_SIZE:
         errors.append("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
+    if RETRIEVAL_MODE not in {"hybrid", "dense"}:
+        errors.append(f"RETRIEVAL_MODE must be hybrid or dense, got {RETRIEVAL_MODE!r}.")
     if CAL_API_KEY and CAL_EVENT_TYPE_ID <= 0:
         errors.append("CAL_EVENT_TYPE_ID must be set when CAL_API_KEY is set.")
 
