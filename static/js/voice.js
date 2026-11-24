@@ -178,6 +178,9 @@ export class Microphone {
   }
 }
 
+/** Silence that ends an utterance. Shorter replies sooner; too short cuts people off mid-pause. */
+const END_OF_SPEECH_MS = 600;
+
 /**
  * Hands-free conversation: listens continuously, detects the start and end of
  * each utterance, and hands finished recordings to ``onUtterance``.
@@ -248,7 +251,7 @@ export class HandsFree {
 
     this.below = level < threshold * 0.8 ? this.below + 50 : 0;
     const spoken = now - this.speechStarted;
-    if ((this.below >= 800 && spoken >= 350) || spoken > 30000) this.finishUtterance();
+    if ((this.below >= END_OF_SPEECH_MS && spoken >= 350) || spoken > 30000) this.finishUtterance();
   }
 
   async finishUtterance() {

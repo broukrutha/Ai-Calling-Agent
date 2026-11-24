@@ -171,6 +171,9 @@ LLM_SYSTEM_PROMPT: str = (
 
 # ── Latency budget (milliseconds) ────────────────────────────────────────────
 LATENCY_TARGET_TOTAL_MS: int = _env_int("LATENCY_TARGET_TOTAL_MS", 3000)
+# Speak the first clause as soon as it is this long instead of waiting for the
+# whole first sentence (0 waits for full sentences).
+FIRST_CHUNK_MIN_CHARS: int = _env_int("FIRST_CHUNK_MIN_CHARS", 40)
 
 # ── RAG / ChromaDB ───────────────────────────────────────────────────────────
 CHROMA_PERSIST_DIR: str = _env_str("CHROMA_PERSIST_DIR", "./chroma_db")

@@ -44,6 +44,28 @@ def test_sentences_are_cut_as_text_streams_in():
     assert out == ["Hello there, welcome.", "We open at 9.30 AM.", "Call us today!"]
 
 
+def _chunks(chunker, tokens):
+    out = []
+    for token in tokens:
+        out += chunker.feed(token)
+    return out + chunker.flush()
+
+
+def test_first_chunk_can_end_at_a_clause_to_start_speaking_sooner():
+    tokens = ["Root canal treatment costs 6,500 rupees ", "for a front tooth, ", "and 9,000 rupees for a molar, ",
+              "including the X-ray. ", "Shall I book a visit?"]
+    assert _chunks(SentenceChunker(first_clause_chars=40), tokens) == [
+        "Root canal treatment costs 6,500 rupees for a front tooth,",       # the "6,500" comma never cuts
+        "and 9,000 rupees for a molar, including the X-ray.",              # later pieces are whole sentences
+        "Shall I book a visit?",
+    ]
+    # Off by default, and a clause shorter than the minimum waits for the sentence.
+    assert _chunks(SentenceChunker(), tokens)[0].endswith("including the X-ray.")
+    assert _chunks(SentenceChunker(first_clause_chars=40), ["Yes, ", "we are open on Sunday mornings. ", "Come by!"]) == [
+        "Yes, we are open on Sunday mornings.", "Come by!",
+    ]
+
+
 @pytest.mark.parametrize("text,expected", [
     ("It costs Rs. 30 per hour. Paid monthly.", ["It costs Rs. 30 per hour.", "Paid monthly."]),
     ("Version 3.5 is out now.", ["Version 3.5 is out now."]),

@@ -54,6 +54,7 @@ BOOKING_SOURCE = "Appointment calendar"
 _FILLER_WORDS = frozenset({"um", "uh", "ah", "hmm", "hm", "er", "err", "mm", "mhm"})
 _ABBREVIATIONS = frozenset({"mr.", "mrs.", "ms.", "dr.", "rs.", "no.", "st.", "vs.", "e.g.", "i.e.", "etc."})
 _SENTENCE_END = ".!?।॥"
+_CLAUSE_END = ",;:—–"
 
 
 # ── Small text helpers ───────────────────────────────────────────────────────
@@ -117,11 +118,17 @@ class SentenceChunker:
     ("3.5"), common abbreviations ("Rs. 30") and fragments shorter than
     ``min_chars`` do not end a sentence — short pieces sound choppy when
     synthesised on their own.
+
+    With ``first_clause_chars`` set, the *first* piece may also end at a clause
+    (``, ; : —``) once it is that long, so speech can start before the model
+    has finished its first sentence. Later pieces are whole sentences.
     """
 
-    def __init__(self, min_chars: int = MIN_TTS_SENTENCE_CHARS) -> None:
+    def __init__(self, min_chars: int = MIN_TTS_SENTENCE_CHARS, first_clause_chars: int = 0) -> None:
         self._buffer = ""
         self._min_chars = min_chars
+        self._first_clause_chars = first_clause_chars
+        self._emitted = False
 
     def _boundary(self) -> int | None:
         text = self._buffer
@@ -130,6 +137,11 @@ class SentenceChunker:
                 if len(text[:index].strip()) >= self._min_chars:
                     return index + 1
                 continue
+            if (
+                char in _CLAUSE_END and self._first_clause_chars and not self._emitted
+                and text[index + 1].isspace() and len(text[: index + 1].strip()) >= self._first_clause_chars
+            ):
+                return index + 1
             if char not in _SENTENCE_END or not text[index + 1].isspace():
                 continue
             candidate = text[: index + 1].strip()
@@ -147,6 +159,7 @@ class SentenceChunker:
             sentence, self._buffer = self._buffer[:cut].strip(), self._buffer[cut:]
             if sentence:
                 sentences.append(sentence)
+                self._emitted = True
         return sentences
 
     def flush(self) -> list[str]:
@@ -334,7 +347,7 @@ class VoiceAgent:
         Forward text as it arrives and synthesise each finished sentence in the
         background. Audio is yielded in sentence order as soon as it is ready.
         """
-        chunker = SentenceChunker()
+        chunker = SentenceChunker(first_clause_chars=config.FIRST_CHUNK_MIN_CHARS)
         pending: deque[asyncio.Task[bytes | None]] = deque()
         tts_started: float | None = None
 

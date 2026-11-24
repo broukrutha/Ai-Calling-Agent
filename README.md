@@ -31,7 +31,15 @@ A voice agent that answers and places phone calls, answers questions from your o
                                     booking and call log, used as LLM tools)
 ```
 
-**Latency.** The LLM answer is streamed, cut into sentences as it arrives, and each sentence is sent to text-to-speech while the model is still writing. The caller hears the first sentence without waiting for the whole answer. The Playground shows a per-turn latency waterfall, including time to first audio.
+**Latency.** The model's answer is streamed and cut into speakable pieces as it arrives. Each piece goes to text-to-speech while the model is still writing. The first piece may end at a clause (a comma or semicolon) once it is 40 characters long, so the caller starts hearing the reply before the first sentence is finished (`FIRST_CHUNK_MIN_CHARS`). In the browser's hands-free mode, a 600 ms pause ends your turn; on the phone, the speech-to-text service decides.
+
+Our own code adds about 40 ms per turn (p50, 81 ms p95): knowledge search plus the pipeline, measured with the real embedding model and instant stand-in services over the 63 golden questions. The rest is the speech and model services. To measure them with your keys:
+
+```bash
+python scripts/latency_probe.py
+```
+
+It speaks five questions, runs each through the full pipeline, and prints speech-to-text, search, model first token, text-to-speech and time to first audio at p50 and p95. In production, the Monitoring page shows the same numbers for every real call. The Playground's inspector shows them for each turn.
 
 **Interruptions.** In hands-free mode the console listens continuously, sends what you said when you pause, and stops the agent mid-sentence if you start talking (barge-in): playback stops at once and the server cancels the rest of that answer.
 
@@ -183,6 +191,7 @@ All settings are environment variables (see [`.env.example`](.env.example) for t
 | `RETRIEVAL_MODE`, `LEXICAL_WEIGHT` | `hybrid` (meaning + keywords) or `dense`; weight of the keyword match. | `hybrid`, 0.2 |
 | `TOP_K_RETRIEVAL`, `RELEVANCE_MARGIN` | Passages given to the model; how far below the best match a passage may score. | 3, 0.15 |
 | `ENABLE_RERANKER` | Cross-encoder re-ranking of the candidates. | `false` |
+| `FIRST_CHUNK_MIN_CHARS` | Start speaking at the first clause once it is this long (0 waits for full sentences). | 40 |
 | `LLM_STALL_TIMEOUT_SEC`, `LLM_REASONING_EFFORT` | Abandon a provider that stops streaming; reasoning effort for gpt-oss / o-series models. | 8, `low` |
 | `TRACING_ENABLED`, `TRACE_STORE_TEXT`, `TRACE_RETENTION_DAYS` | Per-turn tracing for the Monitoring page. | on, on, 30 |
 
@@ -307,7 +316,7 @@ voice_agent/
   server/                   app.py · security.py · schemas.py · routes/
 evaluation/                 Golden questions, dialog scenarios, metrics, LLM judge, CLI, report
 static/                     Web console: ES modules, no build step, self-hosted font
-scripts/                    seed_kb.py · reindex_kb.py · generate_palette.py · check_llm.py · check_calcom.py
+scripts/                    seed_kb.py · reindex_kb.py · latency_probe.py · generate_palette.py · check_llm.py · check_calcom.py
 tests/                      Test suite
 ```
 
